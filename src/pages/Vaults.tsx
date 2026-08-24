@@ -40,8 +40,10 @@ import {
   contractService,
   VaultData,
   VaultReleaseState,
+  EmergencyUnlockSchedule,
 } from "../services/contract.service";
 import { shortenAddress, isValidAddress, isValidMultiChainAddress, formatDate, getVaultGID, buildVaultDocumentCounts, keyRecordByVaultGID } from "../utils/helpers";
+import { describeEmergencyUnlock } from "../utils/emergencyUnlockStatus";
 import { identityService } from "../services/identity.service";
 import { toast } from "react-hot-toast";
 import { buttonClasses } from "../utils/buttonClasses";
@@ -61,6 +63,7 @@ const Vaults = () => {
 
   const [vaults, setVaults] = useState<Vault[]>([]);
   const [releaseStatesByVault, setReleaseStatesByVault] = useState<Record<string, VaultReleaseState>>({});
+  const [unlockSchedulesByVault, setUnlockSchedulesByVault] = useState<Record<string, EmergencyUnlockSchedule>>({});
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
   const [togglingEmergencyVaultId, setTogglingEmergencyVaultId] = useState<number | null>(null);
@@ -85,6 +88,7 @@ const Vaults = () => {
   useEffect(() => {
     setVaults([]);
     setReleaseStatesByVault({});
+    setUnlockSchedulesByVault({});
     setLoading(true);
   }, [ecosystem]);
 
@@ -99,6 +103,7 @@ const Vaults = () => {
       setLoading(false);
       setVaults([]);
       setReleaseStatesByVault({});
+      setUnlockSchedulesByVault({});
     }
   }, [account, isConnected, provider, signer, isFujiNetwork, ecosystem, chainId]);
 
@@ -132,15 +137,19 @@ const Vaults = () => {
       });
 
       setVaults(enriched);
-      const releaseStates = await contractService.fetchVaultReleaseStates(
-        visibleVaults.map((vault) => vault.id)
-      );
+      const vaultIds = visibleVaults.map((vault) => vault.id);
+      const [releaseStates, unlockSchedules] = await Promise.all([
+        contractService.fetchVaultReleaseStates(vaultIds),
+        contractService.fetchEmergencyUnlockSchedules(vaultIds),
+      ]);
       setReleaseStatesByVault(keyRecordByVaultGID(ecosystem, chainId, releaseStates));
+      setUnlockSchedulesByVault(keyRecordByVaultGID(ecosystem, chainId, unlockSchedules));
     } catch (error) {
       console.error("Error loading vaults:", error);
       const message = error instanceof Error ? error.message : "Failed to load vaults";
       toast.error(message);
       setReleaseStatesByVault({});
+      setUnlockSchedulesByVault({});
     } finally {
       if (!options?.silent) {
         setLoading(false);
@@ -335,7 +344,16 @@ const Vaults = () => {
     setTogglingEmergencyVaultId(vaultId);
     try {
       await contractService.setEmergencyMode(vaultId, enabled);
-      toast.success(enabled ? "Emergency mode enabled" : "Emergency mode disabled");
+      if (enabled) {
+        const schedule = await contractService.getEmergencyUnlockSchedule(vaultId);
+        toast.success(
+          schedule.requested
+            ? "Emergency mode enabled. Unlock time is randomized on-chain and documents stay locked until VRF fulfillment."
+            : "Emergency mode enabled"
+        );
+      } else {
+        toast.success("Emergency mode disabled");
+      }
 
       try {
         const beneficiary = await contractService.getBeneficiary(vaultId);
@@ -347,6 +365,19 @@ const Vaults = () => {
       await loadVaults();
     } catch (error: any) {
       toast.error(error.message || "Failed to update emergency mode");
+    } finally {
+      setTogglingEmergencyVaultId(null);
+    }
+  };
+
+  const handleFulfillEmergencyDelay = async (vaultId: number) => {
+    setTogglingEmergencyVaultId(vaultId);
+    try {
+      await contractService.fulfillEmergencyUnlockDelay(vaultId);
+      toast.success("Random delay submitted on-chain");
+      await loadVaults();
+    } catch (error: any) {
+      toast.error(error.message || "Unlock delay is not ready yet. Wait a few ledgers and try again.");
     } finally {
       setTogglingEmergencyVaultId(null);
     }
@@ -558,6 +589,10 @@ const Vaults = () => {
               lastProofOfLife: vault.createdAt,
               postDeathUnlocked: false,
             };
+            const unlockStatus = describeEmergencyUnlock(
+              releaseState.emergencyMode,
+              unlockSchedulesByVault[vault.gid]
+            );
             const inactivityDays = Math.max(1, Math.round(releaseState.inactivityPeriod / 86400));
             const isCreator = vault.creator.toLowerCase() === account?.toLowerCase();
             const isGuardian = vault.guardians.some(
@@ -639,7 +674,7 @@ const Vaults = () => {
                           variant="flat"
                           color={releaseState.emergencyMode ? "warning" : "default"}
                         >
-                          {releaseState.emergencyMode ? "Emergency ON" : "Emergency OFF"}
+                          {unlockStatus.label}
                         </Chip>
                         <Chip
                           size="sm"
@@ -661,6 +696,9 @@ const Vaults = () => {
                           ? formatDate(releaseState.lastProofOfLife)
                           : "not recorded"}
                       </p>
+                      {unlockStatus.detail && (
+                        <p className="text-amber-200/90">{unlockStatus.detail}</p>
+                      )}
                     </div>
                     {isCreator && (
                       <div className="flex flex-wrap gap-2 pt-1">
@@ -686,6 +724,20 @@ const Vaults = () => {
                         >
                           {releaseState.emergencyMode ? "Disable Emergency" : "Enable Emergency"}
                         </Button>
+                        {ecosystem === "stellar" &&
+                          releaseState.emergencyMode &&
+                          unlockSchedulesByVault[vault.gid]?.requested &&
+                          !unlockSchedulesByVault[vault.gid]?.fulfilled && (
+                          <Button
+                            size="sm"
+                            className={buttonClasses.ghostSm}
+                            isLoading={togglingEmergencyVaultId === vault.id}
+                            isDisabled={togglingEmergencyVaultId !== null || provingLifeVaultId !== null}
+                            onPress={() => handleFulfillEmergencyDelay(vault.id)}
+                          >
+                            Submit random delay
+                          </Button>
+                        )}
                       </div>
                     )}
                   </div>

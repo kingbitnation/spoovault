@@ -182,6 +182,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     error ZeroShareAlreadySubmitted();
     error InvalidShareRefreshInput();
     error InvalidReshareDuration();
+    error DelegationInvalidOrExpired();
 
     mapping(uint256 => Vault) public vaults;
     mapping(uint256 => Document) public documents;
@@ -243,6 +244,15 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     uint256 public constant DEFAULT_EMERGENCY_JITTER_WINDOW = 1 hours;
     uint256 public constant MIN_JITTER_WINDOW = 5 minutes;
     uint256 public constant MAX_JITTER_WINDOW = 7 days;
+    /// @dev Minimum block progression required after VRF fulfillment before
+    /// emergency documents unlock. Combined with {emergencyUnlockAt} so a miner
+    /// cannot satisfy the delay by nudging `block.timestamp` alone.
+    uint256 public constant MIN_EMERGENCY_UNLOCK_BLOCK_DELTA = 256;
+    /// @dev Avalanche C-Chain block time used to convert VRF jitter seconds
+    /// into additional required block height.
+    uint256 public constant EMERGENCY_SECONDS_PER_BLOCK = 2;
+    /// @dev Chainlink VRF v2.5 ExtraArgsV1 selector (`keccak256("VRF ExtraArgsV1")`).
+    bytes4 private constant VRF_EXTRA_ARGS_V1_TAG = bytes4(keccak256("VRF ExtraArgsV1"));
 
     struct VrfConfig {
         address coordinator; // address(0) => VRF gating disabled (legacy behavior)
@@ -257,12 +267,18 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
 
     // vaultId => scheduled emergency unlock timestamp (0 = not scheduled)
     mapping(uint256 => uint256) public emergencyUnlockAt;
+    // vaultId => scheduled emergency unlock block (0 = not scheduled)
+    mapping(uint256 => uint256) public emergencyUnlockBlock;
     // vaultId => latest VRF request id
     mapping(uint256 => uint256) public vrfRequestIdByVault;
     // requestId => vaultId (reverse lookup for fulfillment)
     mapping(uint256 => uint256) private _vaultIdByRequestId;
     // vaultId => jitter window applied to the VRF offset
     mapping(uint256 => uint256) public emergencyJitterWindow;
+    // vaultId => emergency-cycle epoch; incremented on every VRF-gated enable
+    mapping(uint256 => uint256) public emergencyUnlockEpoch;
+    // requestId => epoch captured at request time
+    mapping(uint256 => uint256) private _epochByRequestId;
 
     // Guardian rotation and threshold adjustment governance
     mapping(uint256 => mapping(address => GuardianRemovalProposal)) public guardianRemovalProposals;
@@ -271,7 +287,12 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     mapping(uint256 => mapping(uint256 => mapping(address => bool))) public hasApprovedThreshold;
 
     event EmergencyUnlockDelayRequested(uint256 indexed vaultId, uint256 indexed requestId);
-    event EmergencyUnlockScheduled(uint256 indexed vaultId, uint256 indexed unlockAt, uint256 jitterSeconds);
+    event EmergencyUnlockScheduled(
+        uint256 indexed vaultId,
+        uint256 indexed unlockAt,
+        uint256 jitterSeconds,
+        uint256 unlockBlock
+    );
     event VrfConfigured(address indexed coordinator, bytes32 keyHash, uint256 subscriptionId);
     event EmergencyJitterWindowSet(uint256 indexed vaultId, uint256 jitterWindow);
 
@@ -280,6 +301,22 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
         keccak256("KeeperAuthorization(uint256 vaultId,address keeper,uint256 expiresAt,uint256 nonce)");
     mapping(uint256 => KeeperAuthorization) public keeperAuthorizations;
     mapping(uint256 => uint256) public keeperAuthNonces;
+
+    // Off-chain guardian approval delegation (EIP-712). A guardian signs a
+    // temporary grant for a delegate; the delegate submits approvals on-chain.
+    // Nonces are independently revocable so leave/coverage does not require
+    // handing over a private key or a guardian-rotation transaction.
+    struct GuardianDelegation {
+        address guardian;
+        address delegate;
+        uint256 vaultId;
+        uint256 validUntil;
+        uint256 nonce;
+    }
+
+    bytes32 private constant GUARDIAN_DELEGATION_TYPEHASH =
+        keccak256("GuardianDelegation(address guardian,address delegate,uint256 vaultId,uint256 validUntil,uint256 nonce)");
+    mapping(address => mapping(uint256 => bool)) public revokedNonces;
 
     // ------------------------------------------------------------------
     // Proactive Secret Sharing (PSS) state.
@@ -342,6 +379,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     event VaultReconfigurationExecuted(uint256 indexed vaultId, address indexed guardianRemoved, uint256 newThreshold);
     event KeeperAuthorized(uint256 indexed vaultId, address indexed owner, address indexed keeper, uint256 expiresAt);
     event KeeperRevoked(uint256 indexed vaultId, address indexed owner);
+    event DelegationNonceRevoked(address indexed guardian, uint256 indexed nonce);
     event ProofOfLifeRelayed(uint256 indexed vaultId, address indexed owner, address indexed keeper, uint256 timestamp);
     event ShareRefreshStarted(uint256 indexed documentId, uint256 indexed epoch, uint256 deadline);
     event ZeroShareCommitmentSubmitted(uint256 indexed documentId, uint256 indexed epoch, address indexed guardian, uint256 degree);
@@ -750,24 +788,26 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
                 if (vrfRequestIdByVault[vaultId] != 0 && !vrfRequestFulfilled(vaultId)) {
                     revert VrfRequestAlreadyPending();
                 }
-                // Fresh episode: clear any previous schedule before re-rolling.
-                emergencyUnlockAt[vaultId] = 0;
+                _clearEmergencyUnlock(vaultId);
+                uint256 epoch = emergencyUnlockEpoch[vaultId] + 1;
+                emergencyUnlockEpoch[vaultId] = epoch;
 
                 uint256 requestId = IVRFCoordinatorV2Plus(_vrfConfig.coordinator).requestRandomWords(
-                    _vrfConfig.keyHash,
-                    _vrfConfig.subscriptionId,
-                    _vrfConfig.minimumRequestConfirmations,
-                    _vrfConfig.callbackGasLimit,
-                    1,
-                    ""
+                    IVRFCoordinatorV2Plus.RandomWordsRequest({
+                        keyHash: _vrfConfig.keyHash,
+                        subId: _vrfConfig.subscriptionId,
+                        requestConfirmations: _vrfConfig.minimumRequestConfirmations,
+                        callbackGasLimit: _vrfConfig.callbackGasLimit,
+                        numWords: 1,
+                        extraArgs: abi.encodeWithSelector(VRF_EXTRA_ARGS_V1_TAG, false)
+                    })
                 );
                 vrfRequestIdByVault[vaultId] = requestId;
                 _vaultIdByRequestId[requestId] = vaultId;
+                _epochByRequestId[requestId] = epoch;
                 emit EmergencyUnlockDelayRequested(vaultId, requestId);
             } else {
-                // Disabling emergency mode resets the schedule entirely.
-                delete vrfRequestIdByVault[vaultId];
-                emergencyUnlockAt[vaultId] = 0;
+                _clearEmergencyUnlock(vaultId);
             }
         }
 
@@ -846,17 +886,29 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
         if (randomWords.length == 0) revert VrfUnknownRequestId();
 
         uint256 vaultId = _vaultIdByRequestId[requestId];
-        if (vaultId == 0) revert VrfUnknownRequestId();
+        if (vaultId == 0 || vrfRequestIdByVault[vaultId] != requestId) revert VrfUnknownRequestId();
+        if (_epochByRequestId[requestId] != emergencyUnlockEpoch[vaultId]) revert VrfUnknownRequestId();
+        if (!_vaultReleaseStates[vaultId].emergencyMode) revert VrfUnknownRequestId();
         if (emergencyUnlockAt[vaultId] != 0) revert VrfAlreadyFulfilled();
 
         uint256 window = emergencyJitterWindow[vaultId] != 0
             ? emergencyJitterWindow[vaultId]
             : DEFAULT_EMERGENCY_JITTER_WINDOW;
+        if (window == 0) revert InvalidJitterWindow();
         uint256 jitter = randomWords[0] % window;
         uint256 unlockAt = block.timestamp + EMERGENCY_UNLOCK_BASE_DELAY + jitter;
+        // Block bound is the base delay (in blocks) plus a 256-block floor
+        // plus jitter converted to blocks, so timestamp drift alone cannot
+        // satisfy the delay.
+        uint256 baseDelayBlocks = EMERGENCY_UNLOCK_BASE_DELAY / EMERGENCY_SECONDS_PER_BLOCK;
+        uint256 unlockBlock = block.number
+            + baseDelayBlocks
+            + MIN_EMERGENCY_UNLOCK_BLOCK_DELTA
+            + (jitter / EMERGENCY_SECONDS_PER_BLOCK);
 
         emergencyUnlockAt[vaultId] = unlockAt;
-        emit EmergencyUnlockScheduled(vaultId, unlockAt, jitter);
+        emergencyUnlockBlock[vaultId] = unlockBlock;
+        emit EmergencyUnlockScheduled(vaultId, unlockAt, jitter, unlockBlock);
     }
 
     /**
@@ -893,10 +945,27 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     function getEmergencyUnlockSchedule(uint256 vaultId) external view returns (
         bool requested,
         bool fulfilled,
-        uint256 unlockAt
+        uint256 unlockAt,
+        uint256 unlockBlock
     ) {
         uint256 requestId = vrfRequestIdByVault[vaultId];
-        return (requestId != 0, emergencyUnlockAt[vaultId] != 0, emergencyUnlockAt[vaultId]);
+        return (
+            requestId != 0,
+            emergencyUnlockAt[vaultId] != 0,
+            emergencyUnlockAt[vaultId],
+            emergencyUnlockBlock[vaultId]
+        );
+    }
+
+    function _clearEmergencyUnlock(uint256 vaultId) internal {
+        uint256 oldRequestId = vrfRequestIdByVault[vaultId];
+        if (oldRequestId != 0) {
+            delete _vaultIdByRequestId[oldRequestId];
+            delete _epochByRequestId[oldRequestId];
+            delete vrfRequestIdByVault[vaultId];
+        }
+        delete emergencyUnlockAt[vaultId];
+        delete emergencyUnlockBlock[vaultId];
     }
 
     /**
@@ -1355,7 +1424,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
      * @dev Approve an access request (accepted guardian only, never the requester).
      */
     function approveAccess(uint256 requestId) external nonReentrant {
-        _approveAccess(requestId, "");
+        _approveAccess(requestId, "", msg.sender);
     }
 
     /**
@@ -1364,36 +1433,104 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
      * distinct accepted guardians other than the requester.
      */
     function approveAccess(uint256 requestId, string calldata encryptedShareForBeneficiary) external nonReentrant {
-        _approveAccess(requestId, encryptedShareForBeneficiary);
+        _approveAccess(requestId, encryptedShareForBeneficiary, msg.sender);
     }
 
-    function _approveAccess(uint256 requestId, string memory encryptedShareForBeneficiary) internal {
+    /**
+     * @dev Instantly invalidate a previously signed {GuardianDelegation} nonce.
+     *      Only the guardian who issued the nonce can revoke it.
+     */
+    function revokeDelegation(uint256 nonce) external {
+        revokedNonces[msg.sender][nonce] = true;
+        emit DelegationNonceRevoked(msg.sender, nonce);
+    }
+
+    /**
+     * @dev Recover and validate an EIP-712 `GuardianDelegation` signature.
+     *      Reverts with {DelegationInvalidOrExpired} when the grant is past
+     *      `validUntil`, the nonce has been revoked, or the signer is not `guardian`.
+     */
+    function verifyDelegation(
+        address guardian,
+        address delegate,
+        uint256 vaultId,
+        uint256 validUntil,
+        uint256 nonce,
+        bytes calldata signature
+    ) public view {
+        if (block.timestamp > validUntil || revokedNonces[guardian][nonce] || !isGuardian[vaultId][guardian]) {
+            revert DelegationInvalidOrExpired();
+        }
+
+        bytes32 digest = _hashTypedDataV4(
+            keccak256(
+                abi.encode(GUARDIAN_DELEGATION_TYPEHASH, guardian, delegate, vaultId, validUntil, nonce)
+            )
+        );
+        (address signer, ECDSA.RecoverError err, ) = ECDSA.tryRecover(digest, signature);
+        if (err != ECDSA.RecoverError.NoError || signer != guardian) {
+            revert DelegationInvalidOrExpired();
+        }
+    }
+
+    /**
+     * @dev Delegate submits an approval (and optional beneficiary share) on behalf
+     *      of `guardian` using a valid EIP-712 {GuardianDelegation} signature.
+     *      The approval is recorded against the guardian, not the delegate.
+     */
+    function approveAccessByDelegation(
+        uint256 requestId,
+        address guardian,
+        uint256 validUntil,
+        uint256 nonce,
+        bytes calldata signature,
+        string calldata encryptedShareForBeneficiary
+    ) external nonReentrant {
+        AccessRequest storage request = accessRequests[requestId];
+        if (request.requestId == 0) revert RequestNotExist();
+
+        verifyDelegation(
+            guardian,
+            msg.sender,
+            documents[request.documentId].vaultId,
+            validUntil,
+            nonce,
+            signature
+        );
+        _approveAccess(requestId, encryptedShareForBeneficiary, guardian);
+    }
+
+    function _approveAccess(
+        uint256 requestId,
+        string memory encryptedShareForBeneficiary,
+        address guardian
+    ) internal {
         AccessRequest storage request = accessRequests[requestId];
         if (request.requestId == 0) revert RequestNotExist();
         if (request.status != RequestStatus.PENDING) revert RequestNotPending();
         if (request.expiresAt <= block.timestamp) revert RequestExpired();
-        if (request.requester == msg.sender) revert CannotSelfApproveAccess();
+        if (request.requester == guardian || request.requester == msg.sender) revert CannotSelfApproveAccess();
 
         uint256 vaultId = documents[request.documentId].vaultId;
-        if (!isGuardian[vaultId][msg.sender]) revert OnlyGuardian();
-        if (hasApprovedRequest[requestId][msg.sender]) revert AlreadyApproved();
+        if (!isGuardian[vaultId][guardian]) revert OnlyGuardian();
+        if (hasApprovedRequest[requestId][guardian]) revert AlreadyApproved();
 
         // A guardian whose registered key is blacklisted as compromised may not submit
         // new key material until it has been rotated via revokeKey().
-        bytes memory guardianKey = bytes(userPublicKeys[msg.sender]);
+        bytes memory guardianKey = bytes(userPublicKeys[guardian]);
         if (guardianKey.length != 0 && _revokedKeyHashes[keccak256(guardianKey)]) {
             revert RevokedPublicKey();
         }
 
-        hasApprovedRequest[requestId][msg.sender] = true;
-        request.approvedBy.push(msg.sender);
+        hasApprovedRequest[requestId][guardian] = true;
+        request.approvedBy.push(guardian);
 
         if (bytes(encryptedShareForBeneficiary).length > 0) {
-            beneficiaryKeyShares[requestId][msg.sender] = encryptedShareForBeneficiary;
-            emit ShareSubmittedForBeneficiary(requestId, msg.sender, encryptedShareForBeneficiary);
+            beneficiaryKeyShares[requestId][guardian] = encryptedShareForBeneficiary;
+            emit ShareSubmittedForBeneficiary(requestId, guardian, encryptedShareForBeneficiary);
         }
 
-        emit AccessApproved(requestId, msg.sender);
+        emit AccessApproved(requestId, guardian);
 
         if (request.approvedBy.length >= vaults[vaultId].approvalThreshold) {
             if (!_ownsVaultToken(request.requester, vaultId)) {
@@ -1731,10 +1868,15 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
             }
 
             uint256 scheduledAt = emergencyUnlockAt[vaultId];
-            if (vrfRequestIdByVault[vaultId] != 0) {
-                // VRF-gated vault: releasable only at the verifiably
-                // scheduled time (pending requests stay locked).
-                return block.timestamp >= scheduledAt && scheduledAt != 0;
+            if (_vrfConfig.coordinator != address(0)) {
+                // VRF-gated vault: releasable only once both the verifiable
+                // timestamp and block-height bounds have elapsed (pending
+                // requests stay locked). Dual bounds stop miners from
+                // unlocking via short-range timestamp drift alone.
+                return scheduledAt != 0
+                    && emergencyUnlockBlock[vaultId] != 0
+                    && block.timestamp >= scheduledAt
+                    && block.number >= emergencyUnlockBlock[vaultId];
             }
 
             // Legacy behavior for deployments without VRF configured.

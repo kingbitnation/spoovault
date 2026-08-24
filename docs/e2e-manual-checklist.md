@@ -51,7 +51,7 @@ Expected:
 ## 5. Release Policy Checks
 
 1. `live_only`: request should fail once post-death unlock is active.
-2. `emergency_only`: request works when emergency mode is on.
+2. `emergency_only`: request stays locked until emergency mode is on **and** the VRF/PRNG unlock schedule has matured (legacy EVM deployments without a VRF coordinator still unlock immediately).
 3. `post_death_only`: request works after inactivity window passes.
 
 ## 6. Reliability Checks

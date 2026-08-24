@@ -108,6 +108,44 @@ async function main() {
   await contract.waitForDeployment();
 
   const address = await contract.getAddress();
+  const deployed = new ethers.Contract(address, abi, wallet);
+  const code = await provider.getCode(address);
+  const runtimeBytes = (code.length - 2) / 2;
+  if (runtimeBytes > 24576) {
+    console.warn(
+      `\n⚠️  Runtime bytecode is ${runtimeBytes} bytes (EIP-170 limit 24576). ` +
+        "This deployment may be rejected on networks that enforce the cap."
+    );
+  }
+
+  const vrfCoordinator = process.env.VRF_COORDINATOR || process.env.CHAINLINK_VRF_COORDINATOR;
+  if (vrfCoordinator && vrfCoordinator !== ethers.ZeroAddress) {
+    const keyHash = process.env.VRF_KEY_HASH || process.env.CHAINLINK_VRF_KEY_HASH;
+    const subscriptionId = process.env.VRF_SUBSCRIPTION_ID || process.env.CHAINLINK_VRF_SUBSCRIPTION_ID;
+    if (!keyHash || !subscriptionId) {
+      console.warn(
+        "\n⚠️  VRF_COORDINATOR is set but VRF_KEY_HASH / VRF_SUBSCRIPTION_ID are missing. Skipping configureVrf."
+      );
+    } else {
+      const callbackGasLimit = Number(process.env.VRF_CALLBACK_GAS_LIMIT || 500000);
+      const confirmations = Number(process.env.VRF_REQUEST_CONFIRMATIONS || 3);
+      console.log("\nConfiguring Chainlink VRF v2.5...");
+      const tx = await deployed.configureVrf(
+        vrfCoordinator,
+        keyHash,
+        subscriptionId,
+        callbackGasLimit,
+        confirmations
+      );
+      await tx.wait();
+      console.log("VRF coordinator:", vrfCoordinator);
+    }
+  } else {
+    console.log(
+      "\nVRF not configured (set VRF_COORDINATOR, VRF_KEY_HASH, VRF_SUBSCRIPTION_ID to enable jittered emergency unlocks)."
+    );
+  }
+
   console.log("\n✅ SpooVault deployed at:", address);
   console.log("\n📝 Next steps:");
   console.log("   1. Update your .env file:");

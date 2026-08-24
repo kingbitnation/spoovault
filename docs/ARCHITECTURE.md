@@ -43,6 +43,7 @@ SpooVault is an enterprise-grade document custody and secret sharing application
 2. **Key Splitting via Shamir Secret Sharing (SSS)**: Master encryption keys are split into threshold shares \( (k, n) \). Shares are distributed securely to designated Guardian public keys via TweetNaCl public-key box encryption.
 3. **Threshold Key Reconstruction**: Beneficiaries initiate document release requests. Guardians independently review and approve requests on-chain. Once the required threshold \( k \) of \( n \) signatures is met, encrypted key packages are released for client-side assembly and document decryption.
 4. **No Self-Approval Invariant**: An access approval can never originate from the request's beneficiary. `_approveAccess` reverts with `CannotSelfApproveAccess` when `msg.sender == request.requester`, so quorum counts only distinct, accepted guardians other than the requester. This holds even when the requester later becomes a guardian (e.g. a request filed before accepting a guardian invite), preventing any self-vote from inflating multi-sig quorum in multi-custody or emergency inheritance configurations.
+5. **VRF / PRNG Emergency Unlock Jitter**: Emergency releases do not use a fixed delay. On Avalanche, `setEmergencyMode(true)` requests Chainlink VRF v2.5 entropy and fulfillment writes `T_random = VRF() mod Delta_T` plus both a timestamp bound and a block-height bound of at least `baseDelayBlocks + 256` additional blocks. On Soroban, the same dual bounds are derived from `env.prng()` after at least 3 confirmation ledgers via `fulfill_emergency_unlock_delay`. Stellar PRNG is ledger-seeded host entropy, not a Chainlink-style VRF proof; it is still not caller-chosen, but a validator that can choose the inclusion ledger can influence the sampled value. Miners/guardians cannot choose the exact unlock ledger from a public fixed delay.
 
 ---
 
@@ -51,10 +52,12 @@ SpooVault is an enterprise-grade document custody and secret sharing application
 ### Avalanche (Solidity `SpooVault.sol`)
 
 - Manages document metadata records, vault configurations, guardian thresholds, and NFT access pass minting on Avalanche Fuji testnet (Chain ID `43113`).
+- Optional Chainlink VRF v2.5 consumer: emergency mode requests verifiable randomness and stores dual timestamp + block-height unlock bounds.
 
 ### Stellar (Soroban Rust Contract)
 
 - Manages document registry, guardian approvals, and key inbox distribution on the Stellar Soroban testnet using native Rust Soroban SDK data structures.
+- Emergency unlocks sample `env.prng()` after confirmation ledgers and gate `EmergencyOnly` documents on both timestamp and ledger sequence.
 
 ---
 

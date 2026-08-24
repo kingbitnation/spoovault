@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **VRF / Soroban PRNG Emergency Unlock Jitter (Issue #93)**:
+  - `contracts/SpooVault.sol`: emergency-mode unlocks now require verifiable randomness fulfillment and satisfy both a timestamp bound and a block-height bound of `baseDelayBlocks + 256 + jitterBlocks` before `EMERGENCY_ONLY` documents can be requested. Stale request IDs are bound to an emergency epoch so a previous cycle cannot write the new schedule.
+  - `contracts/interfaces/IVRFCoordinatorV2Plus.sol` + `contracts/mocks/MockVRFCoordinator.sol`: aligned request API with Chainlink VRF v2.5 `RandomWordsRequest` struct and updated local mock fulfillment path.
+  - `contracts-stellar/src/lib.rs`: added Soroban PRNG-backed emergency unlock scheduling (`set_emergency_jitter_window`, `fulfill_emergency_unlock_delay`, `get_emergency_unlock_schedule`) with dual timestamp+ledger-sequence maturity checks.
+  - Added/expanded contract tests in `test/VrfEmergencyDelay.test.cjs` and `contracts-stellar/src/test.rs` for request creation, fulfillment validation, stale-request rejection, and unlock-bound verification.
+  - Frontend: `contractService.getEmergencyUnlockSchedule` plus Vaults UI copy when a VRF request is outstanding. Stellar emergency enable/fulfill is wired through `stellarService`; a "Submit random delay" control appears while PRNG fulfillment is pending.
+  - Deploy: `scripts/deploy.mjs` optionally calls `configureVrf` when `VRF_COORDINATOR`, `VRF_KEY_HASH`, and `VRF_SUBSCRIPTION_ID` are set, and warns if runtime bytecode exceeds 24,576 bytes.
+  - `cargo test` no longer requires the upgrade-fixture Wasm; CI enables `--features upgrade-tests` after building it.
 - **EIP-712 / Soroban Auth Relayer for Automated Proof-of-Life Heartbeats (Issue #32)**:
   - `SpooVault.sol`: `authorizeKeeperBySig`, `revokeKeeper`, and `proveLifeByKeeper` let a vault owner delegate proof-of-life heartbeats to a Web3 Keeper (Chainlink Automation / Gelato) via a one-time EIP-712 typed signature, so the keeper can relay heartbeats on its own signed transactions until the delegation expires without needing a fresh owner signature each time.
   - `contracts-stellar/src/lib.rs`: `authorize_keeper`, `revoke_keeper`, and `prove_life_by_keeper` mirror the same delegation model using Soroban's native `require_auth`, which already decouples the authorizing owner from the fee-paying/submitting keeper.

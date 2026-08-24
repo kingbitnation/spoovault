@@ -6,7 +6,7 @@ import "../interfaces/IVRFCoordinatorV2Plus.sol";
 /**
  * @dev Test-only mock of the Chainlink VRF v2.5 coordinator.
  * Records consumer requests and lets tests deliver deterministic
- * random words through {fulfillRandomWords}, mirroring the production
+ * random words through {fulfill}, mirroring the production
  * fulfillment path (consumer.rawFulfillRandomWords).
  */
 contract MockVRFCoordinator is IVRFCoordinatorV2Plus {
@@ -15,14 +15,9 @@ contract MockVRFCoordinator is IVRFCoordinatorV2Plus {
     mapping(uint256 => bool) public fulfilled;
 
     function requestRandomWords(
-        bytes32 /* keyHash */,
-        uint256 /* subscriptionId */,
-        uint16 /* minimumRequestConfirmations */,
-        uint32 /* callbackGasLimit */,
-        uint32 numWords,
-        bytes calldata /* extraArgs */
+        RandomWordsRequest calldata req
     ) external override returns (uint256 requestId) {
-        require(numWords == 1, "MockVRFCoordinator: only 1 word supported");
+        require(req.numWords == 1, "MockVRFCoordinator: only 1 word supported");
         _requestCounter += 1;
         requestId = _requestCounter;
         requestConsumer[requestId] = msg.sender;

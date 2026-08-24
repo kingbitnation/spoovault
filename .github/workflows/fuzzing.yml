@@ -127,4 +127,4 @@ jobs:
 
       - name: Run Soroban contract test suite
         working-directory: contracts-stellar
-        run: cargo test
+        run: cargo test --features upgrade-tests

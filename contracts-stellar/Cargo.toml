@@ -17,6 +17,12 @@ ed25519-dalek = "2.2.0"
 k256 = { version = "0.13.1", features = ["ecdsa"] }
 sha3 = "0.10.8"
 
+[features]
+# Compiles `upgrade_contract` integration tests that `contractimport!` the
+# upgrade_fixture Wasm. CI builds that artifact first, then enables this
+# feature. Local `cargo test` stays usable without the Wasm.
+upgrade-tests = []
+
 [profile.release]
 opt-level = "z"
 overflow-checks = true
