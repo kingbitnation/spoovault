@@ -1553,6 +1553,95 @@ const getKeeperAuthorization = async (vaultId: number): Promise<KeeperAuthorizat
   }
 };
 
+/**
+ * Signs an EIP-712 GuardianDelegation grant so a temporary delegate can approve
+ * access requests on behalf of `guardian` until `validUntil` (or nonce revocation).
+ */
+const signGuardianDelegation = async (
+  guardian: string,
+  delegate: string,
+  vaultId: number,
+  validUntil: number,
+  nonce: number
+): Promise<string> => {
+  const contract = ensureWriteContract();
+  const signer = contract.runner;
+  if (!signer || typeof (signer as ethers.Signer).signTypedData !== "function") {
+    throw new Error("A connected wallet signer is required to sign a guardian delegation.");
+  }
+
+  const domain = {
+    name: "SpooVault",
+    version: "1",
+    chainId: getConfiguredChainId(),
+    verifyingContract: getContractAddress(),
+  };
+
+  return (signer as ethers.Signer).signTypedData(domain, GUARDIAN_DELEGATION_EIP712_TYPES, {
+    guardian,
+    delegate,
+    vaultId,
+    validUntil,
+    nonce,
+  });
+};
+
+/**
+ * Submits an access approval as a delegate of `guardian`, using a previously signed
+ * EIP-712 GuardianDelegation. The approval is recorded against the guardian on-chain.
+ */
+const approveAccessByDelegation = async (
+  requestId: number,
+  guardian: string,
+  validUntil: number,
+  nonce: number,
+  signature: string,
+  encryptedShareForBeneficiary = ""
+): Promise<void> => {
+  const contract = ensureWriteContract();
+  if (
+    !contractHasFunction(
+      contract,
+      "approveAccessByDelegation(uint256,address,uint256,uint256,bytes,string)"
+    )
+  ) {
+    throw new Error("Current contract does not support guardian approval delegation.");
+  }
+  const tx = await contract.approveAccessByDelegation(
+    requestId,
+    guardian,
+    validUntil,
+    nonce,
+    signature,
+    encryptedShareForBeneficiary
+  );
+  await waitForReceipt(tx);
+  clearAccessCache();
+};
+
+/** Instantly invalidates a previously signed GuardianDelegation nonce for the caller. */
+const revokeDelegation = async (nonce: number): Promise<void> => {
+  const contract = ensureWriteContract();
+  if (!contractHasFunction(contract, "revokeDelegation(uint256)")) {
+    throw new Error("Current contract does not support guardian approval delegation.");
+  }
+  const tx = await contract.revokeDelegation(nonce);
+  await waitForReceipt(tx);
+};
+
+const isDelegationNonceRevoked = async (guardian: string, nonce: number): Promise<boolean> => {
+  await ensureContractDeployed();
+  const contract = ensureReadContract();
+  if (!contractHasFunction(contract, "revokedNonces(address,uint256)")) {
+    return false;
+  }
+  try {
+    return Boolean(await contract.revokedNonces(guardian, nonce));
+  } catch {
+    return false;
+  }
+};
+
 const fetchPendingInvites = async (user: string): Promise<GuardianInviteData[]> => {
   if (!user) {
     return [];
@@ -2291,6 +2380,10 @@ export const contractService = {
   revokeKeeper,
   relayProofOfLife,
   getKeeperAuthorization,
+  signGuardianDelegation,
+  approveAccessByDelegation,
+  revokeDelegation,
+  isDelegationNonceRevoked,
   fetchPendingApprovalsForGuardian: proxiedFetchPendingApprovalsForGuardian,
   getRecentActivity,
   registerPublicKey: proxiedRegisterPublicKey,

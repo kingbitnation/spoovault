@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **EIP-712 Guardian Approval Delegation**:
+  - `SpooVault.sol`: guardians can sign temporary `GuardianDelegation(guardian, delegate, vaultId, validUntil, nonce)` grants so a delegate can call `approveAccessByDelegation` without transferring keys. Instant revocation via `revokedNonces` / `revokeDelegation`; expired or revoked grants revert with `DelegationInvalidOrExpired`.
+  - `contractService`: `signGuardianDelegation`, `approveAccessByDelegation`, `revokeDelegation`, and `isDelegationNonceRevoked` helpers plus matching ABI fragments.
+  - Hardhat coverage in `test/GuardianDelegation.test.cjs` for domain hashing, signature verification, delegated approvals, expiry, and nonce revocation.
 - **VRF / Soroban PRNG Emergency Unlock Jitter (Issue #93)**:
   - `contracts/SpooVault.sol`: emergency-mode unlocks now require verifiable randomness fulfillment and satisfy both a timestamp bound and a block-height bound of `baseDelayBlocks + 256 + jitterBlocks` before `EMERGENCY_ONLY` documents can be requested. Stale request IDs are bound to an emergency epoch so a previous cycle cannot write the new schedule.
   - `contracts/interfaces/IVRFCoordinatorV2Plus.sol` + `contracts/mocks/MockVRFCoordinator.sol`: aligned request API with Chainlink VRF v2.5 `RandomWordsRequest` struct and updated local mock fulfillment path.
