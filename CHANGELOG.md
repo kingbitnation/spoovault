@@ -13,8 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `contracts/interfaces/IVRFCoordinatorV2Plus.sol` + `contracts/mocks/MockVRFCoordinator.sol`: aligned request API with Chainlink VRF v2.5 `RandomWordsRequest` struct and updated local mock fulfillment path.
   - `contracts-stellar/src/lib.rs`: added Soroban PRNG-backed emergency unlock scheduling (`set_emergency_jitter_window`, `fulfill_emergency_unlock_delay`, `get_emergency_unlock_schedule`) with dual timestamp+ledger-sequence maturity checks.
   - Added/expanded contract tests in `test/VrfEmergencyDelay.test.cjs` and `contracts-stellar/src/test.rs` for request creation, fulfillment validation, stale-request rejection, and unlock-bound verification.
-  - Frontend: `contractService.getEmergencyUnlockSchedule` plus Vaults UI copy when a VRF request is outstanding. Stellar emergency enable/fulfill is wired through `stellarService`; a "Submit random delay" control appears while PRNG fulfillment is pending.
-  - Deploy: `scripts/deploy.mjs` optionally calls `configureVrf` when `VRF_COORDINATOR`, `VRF_KEY_HASH`, and `VRF_SUBSCRIPTION_ID` are set, and warns if runtime bytecode exceeds 24,576 bytes.
+  - Frontend: Vaults shows pending / fulfilled / loading / error unlock status and never claims documents are unlocked from the client. Stellar emergency enable/fulfill is wired through `stellarService`.
+  - Deploy: `scripts/deploy.mjs` deploys and links `EmergencyVrfLogic` + `SpooVaultAdminLogic`, optionally calls `configureVrf` from VRF env vars, and reports runtime size vs EIP-170.
+  - VRF request/fulfillment lives in `EmergencyVrfLogic`; guardian rotation, PSS refresh, invite listing, and GID string formatting live in `SpooVaultAdminLogic` so the vault can be linked under EIP-170.
+  - Optimizer `runs` is 1 (size-biased). Tests deploy via `test/helpers/deploySpooVault.cjs`.
+  - `npm run test:stellar` runs cargo against a temp `CARGO_TARGET_DIR` so Windows Application Control does not block the test binary under Documents.
   - `cargo test` no longer requires the upgrade-fixture Wasm; CI enables `--features upgrade-tests` after building it.
 - **EIP-712 / Soroban Auth Relayer for Automated Proof-of-Life Heartbeats (Issue #32)**:
   - `SpooVault.sol`: `authorizeKeeperBySig`, `revokeKeeper`, and `proveLifeByKeeper` let a vault owner delegate proof-of-life heartbeats to a Web3 Keeper (Chainlink Automation / Gelato) via a one-time EIP-712 typed signature, so the keeper can relay heartbeats on its own signed transactions until the delegation expires without needing a fresh owner signature each time.

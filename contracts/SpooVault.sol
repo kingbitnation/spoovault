@@ -3,12 +3,12 @@ pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/utils/Strings.sol";
 import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import "./ISpooVault.sol";
 import "./IERC6551Registry.sol";
-import "./interfaces/IVRFCoordinatorV2Plus.sol";
+import "./libraries/EmergencyVrfLogic.sol";
+import "./libraries/SpooVaultAdminLogic.sol";
 
 /**
  * @title SpooVault
@@ -18,7 +18,6 @@ import "./interfaces/IVRFCoordinatorV2Plus.sol";
  *      interface.
  */
 contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
-    using Strings for uint256;
     uint256 private _tokenIdCounter;
     uint256 private _vaultIdCounter;
     uint256 private _documentIdCounter;
@@ -47,17 +46,6 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
         POST_DEATH_ONLY
     }
 
-    struct Vault {
-        uint256 id;
-        address creator;
-        string name;
-        string description;
-        address[] guardians;
-        uint256 approvalThreshold;
-        bool isActive;
-        uint256 createdAt;
-    }
-
     struct Document {
         uint256 id;
         uint256 vaultId;
@@ -78,13 +66,6 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
         uint256 createdAt;
     }
 
-    struct GuardianInvite {
-        address guardian;
-        uint256 vaultId;
-        bool accepted;
-        uint256 expiresAt;
-    }
-
     struct VaultReleaseState {
         bool emergencyMode;
         uint256 inactivityPeriod;
@@ -94,26 +75,6 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
 
     struct KeeperAuthorization {
         address keeper;
-        uint256 expiresAt;
-    }
-
-    struct GuardianRemovalProposal {
-        uint256 vaultId;
-        address guardianToRemove;
-        address proposedBy;
-        address[] approvedBy;
-        bool executed;
-        uint256 createdAt;
-        uint256 expiresAt;
-    }
-
-    struct ThresholdUpdateProposal {
-        uint256 vaultId;
-        uint256 newThreshold;
-        address proposedBy;
-        address[] approvedBy;
-        bool executed;
-        uint256 createdAt;
         uint256 expiresAt;
     }
 
@@ -184,13 +145,13 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     error InvalidReshareDuration();
     error DelegationInvalidOrExpired();
 
-    mapping(uint256 => Vault) public vaults;
+    mapping(uint256 => SpooVaultAdminLogic.Vault) public vaults;
     mapping(uint256 => Document) public documents;
     mapping(uint256 => AccessRequest) public accessRequests;
     mapping(uint256 => mapping(address => bool)) public isGuardian;
     mapping(uint256 => mapping(address => bool)) public hasAccess;
     mapping(uint256 => mapping(address => AccessLevel)) public userAccessLevel;
-    mapping(address => mapping(uint256 => GuardianInvite)) public guardianInvites;
+    mapping(address => mapping(uint256 => SpooVaultAdminLogic.GuardianInvite)) public guardianInvites;
     mapping(address => uint256[]) public userInviteVaultIds;
     mapping(uint256 => mapping(address => bool)) public hasApprovedRequest;
     mapping(uint256 => mapping(address => uint256)) public latestRequestId;
@@ -251,38 +212,13 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     /// @dev Avalanche C-Chain block time used to convert VRF jitter seconds
     /// into additional required block height.
     uint256 public constant EMERGENCY_SECONDS_PER_BLOCK = 2;
-    /// @dev Chainlink VRF v2.5 ExtraArgsV1 selector (`keccak256("VRF ExtraArgsV1")`).
-    bytes4 private constant VRF_EXTRA_ARGS_V1_TAG = bytes4(keccak256("VRF ExtraArgsV1"));
 
-    struct VrfConfig {
-        address coordinator; // address(0) => VRF gating disabled (legacy behavior)
-        bytes32 keyHash;
-        uint256 subscriptionId;
-        uint32 callbackGasLimit;
-        uint16 minimumRequestConfirmations;
-    }
-
-    VrfConfig private _vrfConfig;
+    EmergencyVrfLogic.Store private _vrf;
     address private immutable _vrfDeployer;
 
-    // vaultId => scheduled emergency unlock timestamp (0 = not scheduled)
-    mapping(uint256 => uint256) public emergencyUnlockAt;
-    // vaultId => scheduled emergency unlock block (0 = not scheduled)
-    mapping(uint256 => uint256) public emergencyUnlockBlock;
-    // vaultId => latest VRF request id
-    mapping(uint256 => uint256) public vrfRequestIdByVault;
-    // requestId => vaultId (reverse lookup for fulfillment)
-    mapping(uint256 => uint256) private _vaultIdByRequestId;
-    // vaultId => jitter window applied to the VRF offset
-    mapping(uint256 => uint256) public emergencyJitterWindow;
-    // vaultId => emergency-cycle epoch; incremented on every VRF-gated enable
-    mapping(uint256 => uint256) public emergencyUnlockEpoch;
-    // requestId => epoch captured at request time
-    mapping(uint256 => uint256) private _epochByRequestId;
-
     // Guardian rotation and threshold adjustment governance
-    mapping(uint256 => mapping(address => GuardianRemovalProposal)) public guardianRemovalProposals;
-    mapping(uint256 => mapping(uint256 => ThresholdUpdateProposal)) public thresholdUpdateProposals;
+    mapping(uint256 => mapping(address => SpooVaultAdminLogic.GuardianRemovalProposal)) public guardianRemovalProposals;
+    mapping(uint256 => mapping(uint256 => SpooVaultAdminLogic.ThresholdUpdateProposal)) public thresholdUpdateProposals;
     mapping(uint256 => mapping(address => mapping(address => bool))) public hasApprovedRemoval;
     mapping(uint256 => mapping(uint256 => mapping(address => bool))) public hasApprovedThreshold;
 
@@ -327,15 +263,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     // guardian then updates S_j' = S_j + sum_i h_i(j). The master secret
     // S(0) is preserved while all old shares become useless.
     // ------------------------------------------------------------------
-    struct ReshareSession {
-        uint256 startedAt;
-        uint256 deadline;
-        uint256 submittedCount;
-        bool active;
-    }
-
-    // documentId => active reshare session
-    mapping(uint256 => ReshareSession) public reshareSessions;
+    mapping(uint256 => SpooVaultAdminLogic.ReshareSession) public reshareSessions;
     // documentId => current share epoch (increments on every successful refresh)
     mapping(uint256 => uint256) public shareEpoch;
     // documentId => epoch => guardian => commitments[0..degree] where
@@ -510,7 +438,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
         _vaultIdCounter += 1;
         uint256 vaultId = _vaultIdCounter;
 
-        Vault storage newVault = vaults[vaultId];
+        SpooVaultAdminLogic.Vault storage newVault = vaults[vaultId];
         newVault.id = vaultId;
         newVault.creator = msg.sender;
         newVault.name = name;
@@ -538,7 +466,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
             if (guardianInvites[guardian][vaultId].expiresAt == 0) {
                 userInviteVaultIds[guardian].push(vaultId);
             }
-            guardianInvites[guardian][vaultId] = GuardianInvite({
+            guardianInvites[guardian][vaultId] = SpooVaultAdminLogic.GuardianInvite({
                 guardian: guardian,
                 vaultId: vaultId,
                 accepted: false,
@@ -558,7 +486,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
         if (!vaults[vaultId].isActive) revert VaultNotActive();
         if (isGuardian[vaultId][msg.sender]) revert AlreadyGuardian();
 
-        GuardianInvite storage invite = guardianInvites[msg.sender][vaultId];
+        SpooVaultAdminLogic.GuardianInvite storage invite = guardianInvites[msg.sender][vaultId];
 
         if (invite.guardian == address(0)) revert NoValidInvite();
         if (invite.accepted) revert NoValidInvite();
@@ -761,13 +689,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
 
     /// @notice Returns the stable cross-chain identifier for an EVM vault.
     function getVaultGID(uint256 vaultId) public view returns (string memory) {
-        return string.concat(
-            block.chainid.toString(),
-            ":",
-            Strings.toHexString(address(this)),
-            ":",
-            vaultId.toString()
-        );
+        return SpooVaultAdminLogic.vaultGidString(vaultId);
     }
 
     /**
@@ -783,31 +705,11 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
 
         _vaultReleaseStates[vaultId].emergencyMode = enabled;
 
-        if (_vrfConfig.coordinator != address(0)) {
+        if (_vrf.coordinator != address(0)) {
             if (enabled) {
-                if (vrfRequestIdByVault[vaultId] != 0 && !vrfRequestFulfilled(vaultId)) {
-                    revert VrfRequestAlreadyPending();
-                }
-                _clearEmergencyUnlock(vaultId);
-                uint256 epoch = emergencyUnlockEpoch[vaultId] + 1;
-                emergencyUnlockEpoch[vaultId] = epoch;
-
-                uint256 requestId = IVRFCoordinatorV2Plus(_vrfConfig.coordinator).requestRandomWords(
-                    IVRFCoordinatorV2Plus.RandomWordsRequest({
-                        keyHash: _vrfConfig.keyHash,
-                        subId: _vrfConfig.subscriptionId,
-                        requestConfirmations: _vrfConfig.minimumRequestConfirmations,
-                        callbackGasLimit: _vrfConfig.callbackGasLimit,
-                        numWords: 1,
-                        extraArgs: abi.encodeWithSelector(VRF_EXTRA_ARGS_V1_TAG, false)
-                    })
-                );
-                vrfRequestIdByVault[vaultId] = requestId;
-                _vaultIdByRequestId[requestId] = vaultId;
-                _epochByRequestId[requestId] = epoch;
-                emit EmergencyUnlockDelayRequested(vaultId, requestId);
+                EmergencyVrfLogic.requestUnlock(_vrf, vaultId);
             } else {
-                _clearEmergencyUnlock(vaultId);
+                EmergencyVrfLogic.clear(_vrf, vaultId);
             }
         }
 
@@ -847,14 +749,14 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
         uint16 minimumRequestConfirmations
     ) external {
         if (msg.sender != _vrfDeployer) revert OnlyVrfCoordinator();
-        _vrfConfig = VrfConfig({
-            coordinator: coordinator,
-            keyHash: keyHash,
-            subscriptionId: subscriptionId,
-            callbackGasLimit: callbackGasLimit,
-            minimumRequestConfirmations: minimumRequestConfirmations
-        });
-        emit VrfConfigured(coordinator, keyHash, subscriptionId);
+        EmergencyVrfLogic.configure(
+            _vrf,
+            coordinator,
+            keyHash,
+            subscriptionId,
+            callbackGasLimit,
+            minimumRequestConfirmations
+        );
     }
 
     /**
@@ -864,12 +766,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     function setEmergencyJitterWindow(uint256 vaultId, uint256 jitterWindow) external {
         if (vaults[vaultId].id == 0) revert VaultNotExist();
         if (vaults[vaultId].creator != msg.sender) revert OnlyVaultCreator();
-        if (jitterWindow < MIN_JITTER_WINDOW || jitterWindow > MAX_JITTER_WINDOW) {
-            revert InvalidJitterWindow();
-        }
-
-        emergencyJitterWindow[vaultId] = jitterWindow;
-        emit EmergencyJitterWindowSet(vaultId, jitterWindow);
+        EmergencyVrfLogic.setJitterWindow(_vrf, vaultId, jitterWindow);
     }
 
     /**
@@ -880,43 +777,33 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
      * resulting unlock schedule.
      */
     function rawFulfillRandomWords(uint256 requestId, uint256[] calldata randomWords) external {
-        if (_vrfConfig.coordinator == address(0) || msg.sender != _vrfConfig.coordinator) {
-            revert OnlyVrfCoordinator();
-        }
-        if (randomWords.length == 0) revert VrfUnknownRequestId();
-
-        uint256 vaultId = _vaultIdByRequestId[requestId];
-        if (vaultId == 0 || vrfRequestIdByVault[vaultId] != requestId) revert VrfUnknownRequestId();
-        if (_epochByRequestId[requestId] != emergencyUnlockEpoch[vaultId]) revert VrfUnknownRequestId();
-        if (!_vaultReleaseStates[vaultId].emergencyMode) revert VrfUnknownRequestId();
-        if (emergencyUnlockAt[vaultId] != 0) revert VrfAlreadyFulfilled();
-
-        uint256 window = emergencyJitterWindow[vaultId] != 0
-            ? emergencyJitterWindow[vaultId]
-            : DEFAULT_EMERGENCY_JITTER_WINDOW;
-        if (window == 0) revert InvalidJitterWindow();
-        uint256 jitter = randomWords[0] % window;
-        uint256 unlockAt = block.timestamp + EMERGENCY_UNLOCK_BASE_DELAY + jitter;
-        // Block bound is the base delay (in blocks) plus a 256-block floor
-        // plus jitter converted to blocks, so timestamp drift alone cannot
-        // satisfy the delay.
-        uint256 baseDelayBlocks = EMERGENCY_UNLOCK_BASE_DELAY / EMERGENCY_SECONDS_PER_BLOCK;
-        uint256 unlockBlock = block.number
-            + baseDelayBlocks
-            + MIN_EMERGENCY_UNLOCK_BLOCK_DELTA
-            + (jitter / EMERGENCY_SECONDS_PER_BLOCK);
-
-        emergencyUnlockAt[vaultId] = unlockAt;
-        emergencyUnlockBlock[vaultId] = unlockBlock;
-        emit EmergencyUnlockScheduled(vaultId, unlockAt, jitter, unlockBlock);
+        uint256 vaultId = _vrf.vaultIdByRequestId[requestId];
+        bool emergencyMode = vaultId != 0 && _vaultReleaseStates[vaultId].emergencyMode;
+        EmergencyVrfLogic.fulfill(_vrf, requestId, randomWords, emergencyMode);
     }
 
-    /**
-     * @dev Returns whether the latest VRF request for a vault has been
-     * fulfilled (a schedule exists).
-     */
     function vrfRequestFulfilled(uint256 vaultId) public view returns (bool) {
-        return emergencyUnlockAt[vaultId] != 0;
+        return _vrf.unlockAt[vaultId] != 0;
+    }
+
+    function emergencyUnlockAt(uint256 vaultId) external view returns (uint256) {
+        return _vrf.unlockAt[vaultId];
+    }
+
+    function emergencyUnlockBlock(uint256 vaultId) external view returns (uint256) {
+        return _vrf.unlockBlock[vaultId];
+    }
+
+    function vrfRequestIdByVault(uint256 vaultId) external view returns (uint256) {
+        return _vrf.requestIdByVault[vaultId];
+    }
+
+    function emergencyJitterWindow(uint256 vaultId) external view returns (uint256) {
+        return _vrf.jitterWindow[vaultId];
+    }
+
+    function emergencyUnlockEpoch(uint256 vaultId) external view returns (uint256) {
+        return _vrf.epoch[vaultId];
     }
 
     /**
@@ -929,13 +816,12 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
         uint32 callbackGasLimit,
         uint16 minimumRequestConfirmations
     ) {
-        VrfConfig memory cfg = _vrfConfig;
         return (
-            cfg.coordinator,
-            cfg.keyHash,
-            cfg.subscriptionId,
-            cfg.callbackGasLimit,
-            cfg.minimumRequestConfirmations
+            _vrf.coordinator,
+            _vrf.keyHash,
+            _vrf.subscriptionId,
+            _vrf.callbackGasLimit,
+            _vrf.minimumRequestConfirmations
         );
     }
 
@@ -948,24 +834,13 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
         uint256 unlockAt,
         uint256 unlockBlock
     ) {
-        uint256 requestId = vrfRequestIdByVault[vaultId];
+        uint256 requestId = _vrf.requestIdByVault[vaultId];
         return (
             requestId != 0,
-            emergencyUnlockAt[vaultId] != 0,
-            emergencyUnlockAt[vaultId],
-            emergencyUnlockBlock[vaultId]
+            _vrf.unlockAt[vaultId] != 0,
+            _vrf.unlockAt[vaultId],
+            _vrf.unlockBlock[vaultId]
         );
-    }
-
-    function _clearEmergencyUnlock(uint256 vaultId) internal {
-        uint256 oldRequestId = vrfRequestIdByVault[vaultId];
-        if (oldRequestId != 0) {
-            delete _vaultIdByRequestId[oldRequestId];
-            delete _epochByRequestId[oldRequestId];
-            delete vrfRequestIdByVault[vaultId];
-        }
-        delete emergencyUnlockAt[vaultId];
-        delete emergencyUnlockBlock[vaultId];
     }
 
     /**
@@ -1008,267 +883,106 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
      * Requires majority consensus (>50%) of guardians to approve before execution.
      */
     function proposeGuardianRemoval(uint256 vaultId, address guardianToRemove) external nonReentrant {
-        if (vaults[vaultId].id == 0) revert VaultNotExist();
-        if (!isGuardian[vaultId][msg.sender]) revert OnlyGuardian();
-        if (!isGuardian[vaultId][guardianToRemove]) revert GuardianNotExists();
-        if (vaults[vaultId].guardians.length <= 1) revert CannotRemoveOnlyGuardian();
-
-        GuardianRemovalProposal storage proposal = guardianRemovalProposals[vaultId][guardianToRemove];
-        
-        if (proposal.createdAt != 0 && proposal.expiresAt > block.timestamp && !proposal.executed) {
-            revert ProposalNotExist();
-        }
-
-        uint256 expiresAt = block.timestamp + 7 days;
-        guardianRemovalProposals[vaultId][guardianToRemove] = GuardianRemovalProposal({
-            vaultId: vaultId,
-            guardianToRemove: guardianToRemove,
-            proposedBy: msg.sender,
-            approvedBy: new address[](0),
-            executed: false,
-            createdAt: block.timestamp,
-            expiresAt: expiresAt
-        });
-
-        emit GuardianRemovalProposed(vaultId, guardianToRemove, msg.sender);
+        SpooVaultAdminLogic.proposeGuardianRemoval(
+            vaults,
+            isGuardian,
+            guardianRemovalProposals,
+            vaultId,
+            guardianToRemove
+        );
     }
 
-    /**
-     * @dev Approve a guardian removal proposal.
-     * Once >50% of guardians approve, the proposal is ready for execution.
-     */
     function approveGuardianRemoval(uint256 vaultId, address guardianToRemove) external nonReentrant {
-        if (vaults[vaultId].id == 0) revert VaultNotExist();
-        if (!isGuardian[vaultId][msg.sender]) revert OnlyGuardian();
-
-        GuardianRemovalProposal storage proposal = guardianRemovalProposals[vaultId][guardianToRemove];
-        if (proposal.createdAt == 0) revert ProposalNotExist();
-        if (proposal.expiresAt <= block.timestamp) revert ProposalExpired();
-        if (proposal.executed) revert ProposalAlreadyExecuted();
-        if (hasApprovedRemoval[vaultId][guardianToRemove][msg.sender]) revert ApprovalAlreadyGiven();
-
-        hasApprovedRemoval[vaultId][guardianToRemove][msg.sender] = true;
-        proposal.approvedBy.push(msg.sender);
-
-        emit GuardianRemovalApproved(vaultId, guardianToRemove, msg.sender);
+        SpooVaultAdminLogic.approveGuardianRemoval(
+            vaults,
+            isGuardian,
+            guardianRemovalProposals,
+            hasApprovedRemoval,
+            vaultId,
+            guardianToRemove
+        );
     }
 
-    /**
-     * @dev Propose an update to the vault's approval threshold.
-     * Requires majority consensus (>50%) of guardians to approve before execution.
-     */
     function proposeThresholdUpdate(uint256 vaultId, uint256 newThreshold) external nonReentrant {
-        if (vaults[vaultId].id == 0) revert VaultNotExist();
-        if (!isGuardian[vaultId][msg.sender]) revert OnlyGuardian();
-        if (newThreshold == 0 || newThreshold > vaults[vaultId].guardians.length) {
-            revert InvalidNewThreshold();
-        }
-
-        ThresholdUpdateProposal storage proposal = thresholdUpdateProposals[vaultId][newThreshold];
-        
-        if (proposal.createdAt != 0 && proposal.expiresAt > block.timestamp && !proposal.executed) {
-            revert ProposalNotExist();
-        }
-
-        uint256 expiresAt = block.timestamp + 7 days;
-        thresholdUpdateProposals[vaultId][newThreshold] = ThresholdUpdateProposal({
-            vaultId: vaultId,
-            newThreshold: newThreshold,
-            proposedBy: msg.sender,
-            approvedBy: new address[](0),
-            executed: false,
-            createdAt: block.timestamp,
-            expiresAt: expiresAt
-        });
-
-        emit ThresholdUpdateProposed(vaultId, newThreshold, msg.sender);
+        SpooVaultAdminLogic.proposeThresholdUpdate(
+            vaults,
+            isGuardian,
+            thresholdUpdateProposals,
+            vaultId,
+            newThreshold
+        );
     }
 
-    /**
-     * @dev Approve a threshold update proposal.
-     * Once >50% of guardians approve, the proposal is ready for execution.
-     */
     function approveThresholdUpdate(uint256 vaultId, uint256 newThreshold) external nonReentrant {
-        if (vaults[vaultId].id == 0) revert VaultNotExist();
-        if (!isGuardian[vaultId][msg.sender]) revert OnlyGuardian();
-
-        ThresholdUpdateProposal storage proposal = thresholdUpdateProposals[vaultId][newThreshold];
-        if (proposal.createdAt == 0) revert ProposalNotExist();
-        if (proposal.expiresAt <= block.timestamp) revert ProposalExpired();
-        if (proposal.executed) revert ProposalAlreadyExecuted();
-        if (hasApprovedThreshold[vaultId][newThreshold][msg.sender]) revert ApprovalAlreadyGiven();
-
-        hasApprovedThreshold[vaultId][newThreshold][msg.sender] = true;
-        proposal.approvedBy.push(msg.sender);
-
-        emit ThresholdUpdateApproved(vaultId, newThreshold, msg.sender);
+        SpooVaultAdminLogic.approveThresholdUpdate(
+            vaults,
+            isGuardian,
+            thresholdUpdateProposals,
+            hasApprovedThreshold,
+            vaultId,
+            newThreshold
+        );
     }
 
-    /**
-     * @dev Execute vault reconfiguration after guardian removal and/or threshold update approvals.
-     * Both proposals (if pending) must have >50% guardian consensus to execute.
-     * Execution is atomic: both changes are applied together or not at all.
-     */
     function executeVaultReconfiguration(
         uint256 vaultId,
         address guardianToRemove,
         uint256 newThreshold
     ) external nonReentrant {
-        if (vaults[vaultId].id == 0) revert VaultNotExist();
-
-        Vault storage vault = vaults[vaultId];
-        uint256 currentGuardianCount = vault.guardians.length;
-        uint256 requiredApprovals = (currentGuardianCount / 2) + 1;
-
-        GuardianRemovalProposal storage removalProposal = guardianRemovalProposals[vaultId][guardianToRemove];
-        ThresholdUpdateProposal storage thresholdProposal = thresholdUpdateProposals[vaultId][newThreshold];
-
-        bool hasRemovalProposal = removalProposal.createdAt != 0 && !removalProposal.executed && removalProposal.expiresAt > block.timestamp;
-        bool hasThresholdProposal = thresholdProposal.createdAt != 0 && !thresholdProposal.executed && thresholdProposal.expiresAt > block.timestamp;
-
-        if (!hasRemovalProposal && !hasThresholdProposal) {
-            revert ProposalNotExist();
-        }
-
-        if (hasRemovalProposal) {
-            if (removalProposal.approvedBy.length < requiredApprovals) {
-                revert InsufficientApprovalsForExecution();
-            }
-
-            _removeGuardian(vaultId, guardianToRemove);
-            removalProposal.executed = true;
-
-            currentGuardianCount--;
-        }
-
-        if (hasThresholdProposal) {
-            if (thresholdProposal.approvedBy.length < requiredApprovals) {
-                revert InsufficientApprovalsForExecution();
-            }
-
-            if (newThreshold > currentGuardianCount) {
-                revert InvalidNewThreshold();
-            }
-
-            vault.approvalThreshold = newThreshold;
-            thresholdProposal.executed = true;
-        }
-
-        emit VaultReconfigurationExecuted(vaultId, guardianToRemove, newThreshold);
+        SpooVaultAdminLogic.executeVaultReconfiguration(
+            vaults,
+            isGuardian,
+            guardianRemovalProposals,
+            thresholdUpdateProposals,
+            vaultId,
+            guardianToRemove,
+            newThreshold
+        );
     }
 
-    // ------------------------------------------------------------------
-    // Proactive Secret Sharing (zero-sharing based share refresh)
-    // ------------------------------------------------------------------
-
-    /**
-     * @dev Opens a reshare window for a document's guardian shares.
-     * Every current guardian must publish a zero-polynomial commitment
-     * before {applyShareRefresh} can bump the share epoch.
-     * @param documentId The document whose shares are being refreshed.
-     * @param duration Length of the submission window (1 hour .. 7 days).
-     */
     function startShareRefresh(uint256 documentId, uint256 duration) external {
-        if (documents[documentId].id == 0) revert DocumentNotExist();
-        uint256 vaultId = documents[documentId].vaultId;
-        if (!isGuardian[vaultId][msg.sender]) revert OnlyGuardian();
-        if (reshareSessions[documentId].active) revert ReshareSessionAlreadyActive();
-        if (duration < 1 hours || duration > 7 days) revert InvalidReshareDuration();
-
-        uint256 nextEpoch = shareEpoch[documentId] + 1;
-        ReshareSession storage session = reshareSessions[documentId];
-        session.startedAt = block.timestamp;
-        session.deadline = block.timestamp + duration;
-        session.submittedCount = 0;
-        session.active = true;
-
-        emit ShareRefreshStarted(documentId, nextEpoch, session.deadline);
+        SpooVaultAdminLogic.startShareRefresh(
+            documents[documentId].id,
+            documents[documentId].vaultId,
+            duration,
+            documentId,
+            isGuardian,
+            reshareSessions,
+            shareEpoch
+        );
     }
 
-    /**
-     * @dev Guardian submits Feldman-style commitments to its zero-polynomial
-     * h_i(x) with the defining property h_i(0) = 0 (enforced on-chain by
-     * requiring commitments[0] == bytes32(0)). Off-chain, h_i(j) is derived
-     * from these commitments and added to guardian j's share.
-     * @param documentId The document whose shares are being refreshed.
-     * @param commitments Coefficient commitments [g^a_0, g^a_1, ..., g^a_t]
-     *        where a_0 must be zero.
-     */
     function submitZeroShareCommitment(uint256 documentId, bytes32[] calldata commitments) external {
-        if (documents[documentId].id == 0) revert DocumentNotExist();
-        ReshareSession storage session = reshareSessions[documentId];
-        if (!session.active) revert ReshareSessionNotActive();
-        if (block.timestamp > session.deadline) revert ReshareDeadlineExceeded();
-
-        uint256 vaultId = documents[documentId].vaultId;
-        if (!isGuardian[vaultId][msg.sender]) revert OnlyGuardian();
-
-        uint256 epoch = shareEpoch[documentId] + 1;
-        if (_zeroShareSubmitted[documentId][epoch][msg.sender]) {
-            revert ZeroShareAlreadySubmitted();
-        }
-        if (commitments.length < 2 || commitments[0] != bytes32(0)) {
-            revert InvalidZeroShareCommitment();
-        }
-
-        _zeroShareSubmitted[documentId][epoch][msg.sender] = true;
-        zeroShareCommitments[documentId][epoch][msg.sender] = commitments;
-        session.submittedCount += 1;
-
-        emit ZeroShareCommitmentSubmitted(documentId, epoch, msg.sender, commitments.length - 1);
+        SpooVaultAdminLogic.submitZeroShareCommitment(
+            documents[documentId].id,
+            documents[documentId].vaultId,
+            documentId,
+            commitments,
+            isGuardian,
+            reshareSessions,
+            shareEpoch,
+            zeroShareCommitments,
+            _zeroShareSubmitted
+        );
     }
 
-    /**
-     * @dev Finalizes the refresh once every current guardian has published a
-     * zero-share commitment. Stores the redistributed (re-encrypted) shares
-     * and irreversibly bumps the share epoch, invalidating all pre-refresh
-     * share material for this document.
-     * @param documentId The document whose shares are being refreshed.
-     * @param guardiansList Full guardian set of the vault (order defines
-     *        the polynomial evaluation points used off-chain).
-     * @param newShares Updated ECIES-encrypted shares, one per guardian.
-     */
     function applyShareRefresh(
         uint256 documentId,
         address[] calldata guardiansList,
         string[] calldata newShares
     ) external {
-        if (documents[documentId].id == 0) revert DocumentNotExist();
-        ReshareSession storage session = reshareSessions[documentId];
-        if (!session.active) revert ReshareSessionNotActive();
-
-        uint256 vaultId = documents[documentId].vaultId;
-        if (!isGuardian[vaultId][msg.sender]) revert OnlyGuardian();
-
-        address[] storage vaultGuardians = vaults[vaultId].guardians;
-        if (
-            guardiansList.length != vaultGuardians.length ||
-            newShares.length != guardiansList.length
-        ) {
-            revert InvalidShareRefreshInput();
-        }
-
-        for (uint256 i = 0; i < guardiansList.length; i++) {
-            address guardian = guardiansList[i];
-            if (!isGuardian[vaultId][guardian]) revert InvalidShareRefreshInput();
-
-            for (uint256 j = 0; j < i; j++) {
-                if (guardiansList[j] == guardian) revert InvalidShareRefreshInput();
-            }
-
-            encryptedGuardianShares[documentId][guardian] = newShares[i];
-        }
-
-        if (session.submittedCount < vaultGuardians.length) {
-            if (block.timestamp <= session.deadline) revert ReshareDeadlineNotReached();
-            revert ReshareIncomplete();
-        }
-
-        session.active = false;
-        uint256 newEpoch = shareEpoch[documentId] + 1;
-        shareEpoch[documentId] = newEpoch;
-
-        emit SharesRefreshed(documentId, newEpoch);
+        SpooVaultAdminLogic.applyShareRefresh(
+            documents[documentId].id,
+            documents[documentId].vaultId,
+            documentId,
+            guardiansList,
+            newShares,
+            vaults,
+            isGuardian,
+            encryptedGuardianShares,
+            reshareSessions,
+            shareEpoch
+        );
     }
 
     /**
@@ -1304,26 +1018,8 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
         uint256 submittedCount,
         bool active
     ) {
-        ReshareSession storage session = reshareSessions[documentId];
+        SpooVaultAdminLogic.ReshareSession storage session = reshareSessions[documentId];
         return (session.startedAt, session.deadline, session.submittedCount, session.active);
-    }
-
-    /**
-     * @dev Internal helper to remove a guardian from a vault.
-     */
-    function _removeGuardian(uint256 vaultId, address guardianToRemove) internal {
-        Vault storage vault = vaults[vaultId];
-        
-        for (uint256 i = 0; i < vault.guardians.length; i++) {
-            if (vault.guardians[i] == guardianToRemove) {
-                vault.guardians[i] = vault.guardians[vault.guardians.length - 1];
-                vault.guardians.pop();
-                break;
-            }
-        }
-
-        isGuardian[vaultId][guardianToRemove] = false;
-        emit GuardianRemoved(vaultId, guardianToRemove);
     }
 
     /**
@@ -1646,7 +1342,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
         bool isActive,
         uint256 createdAt
     ) {
-        Vault storage vault = vaults[vaultId];
+        SpooVaultAdminLogic.Vault storage vault = vaults[vaultId];
         return (
             vault.id,
             vault.creator,
@@ -1662,29 +1358,8 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     /**
      * @dev Get user's pending invites.
      */
-    function getPendingInvites(address user) external view returns (GuardianInvite[] memory) {
-        uint256[] storage vaultIds = userInviteVaultIds[user];
-        uint256 count = 0;
-
-        for (uint256 i = 0; i < vaultIds.length; i++) {
-            GuardianInvite storage invite = guardianInvites[user][vaultIds[i]];
-            if (!invite.accepted && invite.expiresAt > block.timestamp) {
-                count++;
-            }
-        }
-
-        GuardianInvite[] memory pending = new GuardianInvite[](count);
-        uint256 index = 0;
-
-        for (uint256 i = 0; i < vaultIds.length; i++) {
-            GuardianInvite storage invite = guardianInvites[user][vaultIds[i]];
-            if (!invite.accepted && invite.expiresAt > block.timestamp) {
-                pending[index] = invite;
-                index++;
-            }
-        }
-
-        return pending;
+    function getPendingInvites(address user) external view returns (SpooVaultAdminLogic.GuardianInvite[] memory) {
+        return SpooVaultAdminLogic.pendingInvites(user, userInviteVaultIds, guardianInvites);
     }
 
     /**
@@ -1867,16 +1542,8 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
                 return false;
             }
 
-            uint256 scheduledAt = emergencyUnlockAt[vaultId];
-            if (_vrfConfig.coordinator != address(0)) {
-                // VRF-gated vault: releasable only once both the verifiable
-                // timestamp and block-height bounds have elapsed (pending
-                // requests stay locked). Dual bounds stop miners from
-                // unlocking via short-range timestamp drift alone.
-                return scheduledAt != 0
-                    && emergencyUnlockBlock[vaultId] != 0
-                    && block.timestamp >= scheduledAt
-                    && block.number >= emergencyUnlockBlock[vaultId];
+            if (_vrf.coordinator != address(0)) {
+                return EmergencyVrfLogic.isReleased(_vrf, vaultId);
             }
 
             // Legacy behavior for deployments without VRF configured.

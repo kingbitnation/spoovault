@@ -1,5 +1,6 @@
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
+const { deploySpooVault } = require("./helpers/deploySpooVault.cjs");
 
 describe("SpooVault Cross-Contract Access Delegation (ISpooVault / ERC-165)", function () {
   let spooVault;
@@ -15,9 +16,7 @@ describe("SpooVault Cross-Contract Access Delegation (ISpooVault / ERC-165)", fu
   beforeEach(async function () {
     [owner, guardian1, beneficiary] = await ethers.getSigners();
 
-    const SpooVault = await ethers.getContractFactory("SpooVault");
-    spooVault = await SpooVault.deploy();
-    await spooVault.waitForDeployment();
+    spooVault = await deploySpooVault();
 
     const SpooVaultConsumer = await ethers.getContractFactory(
       "SpooVaultConsumer"

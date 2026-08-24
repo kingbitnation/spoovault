@@ -1,5 +1,6 @@
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
+const { deploySpooVault } = require("./helpers/deploySpooVault.cjs");
 
 describe("SpooVault Key Rotation & Emergency Revocation (issue #156)", function () {
   let spooVault;
@@ -14,9 +15,7 @@ describe("SpooVault Key Rotation & Emergency Revocation (issue #156)", function 
   beforeEach(async function () {
     [owner, guardian1, guardian2, beneficiary] = await ethers.getSigners();
 
-    const SpooVault = await ethers.getContractFactory("SpooVault");
-    spooVault = await SpooVault.deploy();
-    await spooVault.waitForDeployment();
+    spooVault = await deploySpooVault();
 
     await spooVault.connect(beneficiary).registerPublicKey(OLD_KEY);
   });

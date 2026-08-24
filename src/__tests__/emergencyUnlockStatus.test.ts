@@ -50,4 +50,26 @@ describe("describeEmergencyUnlock", () => {
     expect(status.label).toBe("Emergency ON");
     expect(status.detail).toMatch(/legacy immediate-unlock/i);
   });
+
+  it("shows a loading state without claiming unlock", () => {
+    const status = describeEmergencyUnlock(
+      true,
+      { requested: true, fulfilled: true, unlockAt: 1, unlockBlock: 1 },
+      "loading"
+    );
+    expect(status.claimsUnlocked).toBe(false);
+    expect(status.label).toBe("Loading unlock status");
+    expect(status.detail).toMatch(/stay locked/i);
+  });
+
+  it("shows an error state without claiming unlock", () => {
+    const status = describeEmergencyUnlock(
+      true,
+      { requested: true, fulfilled: true, unlockAt: 1, unlockBlock: 1 },
+      "error"
+    );
+    expect(status.claimsUnlocked).toBe(false);
+    expect(status.label).toBe("Unlock status unavailable");
+    expect(status.detail).toMatch(/could not load/i);
+  });
 });

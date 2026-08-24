@@ -43,7 +43,7 @@ import {
   EmergencyUnlockSchedule,
 } from "../services/contract.service";
 import { shortenAddress, isValidAddress, isValidMultiChainAddress, formatDate, getVaultGID, buildVaultDocumentCounts, keyRecordByVaultGID } from "../utils/helpers";
-import { describeEmergencyUnlock } from "../utils/emergencyUnlockStatus";
+import { EmergencyUnlockStatusView } from "../components/EmergencyUnlockStatusView";
 import { identityService } from "../services/identity.service";
 import { toast } from "react-hot-toast";
 import { buttonClasses } from "../utils/buttonClasses";
@@ -64,6 +64,7 @@ const Vaults = () => {
   const [vaults, setVaults] = useState<Vault[]>([]);
   const [releaseStatesByVault, setReleaseStatesByVault] = useState<Record<string, VaultReleaseState>>({});
   const [unlockSchedulesByVault, setUnlockSchedulesByVault] = useState<Record<string, EmergencyUnlockSchedule>>({});
+  const [unlockScheduleLoadState, setUnlockScheduleLoadState] = useState<"ready" | "loading" | "error">("loading");
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
   const [togglingEmergencyVaultId, setTogglingEmergencyVaultId] = useState<number | null>(null);
@@ -104,6 +105,7 @@ const Vaults = () => {
       setVaults([]);
       setReleaseStatesByVault({});
       setUnlockSchedulesByVault({});
+      setUnlockScheduleLoadState("ready");
     }
   }, [account, isConnected, provider, signer, isFujiNetwork, ecosystem, chainId]);
 
@@ -138,18 +140,30 @@ const Vaults = () => {
 
       setVaults(enriched);
       const vaultIds = visibleVaults.map((vault) => vault.id);
-      const [releaseStates, unlockSchedules] = await Promise.all([
-        contractService.fetchVaultReleaseStates(vaultIds),
-        contractService.fetchEmergencyUnlockSchedules(vaultIds),
-      ]);
-      setReleaseStatesByVault(keyRecordByVaultGID(ecosystem, chainId, releaseStates));
-      setUnlockSchedulesByVault(keyRecordByVaultGID(ecosystem, chainId, unlockSchedules));
+      if (!options?.silent) {
+        setUnlockScheduleLoadState("loading");
+      }
+      try {
+        const [releaseStates, unlockSchedules] = await Promise.all([
+          contractService.fetchVaultReleaseStates(vaultIds),
+          contractService.fetchEmergencyUnlockSchedules(vaultIds),
+        ]);
+        setReleaseStatesByVault(keyRecordByVaultGID(ecosystem, chainId, releaseStates));
+        setUnlockSchedulesByVault(keyRecordByVaultGID(ecosystem, chainId, unlockSchedules));
+        setUnlockScheduleLoadState("ready");
+      } catch (scheduleError) {
+        console.error("Error loading emergency unlock schedules:", scheduleError);
+        setUnlockScheduleLoadState("error");
+        setReleaseStatesByVault({});
+        setUnlockSchedulesByVault({});
+      }
     } catch (error) {
       console.error("Error loading vaults:", error);
       const message = error instanceof Error ? error.message : "Failed to load vaults";
       toast.error(message);
       setReleaseStatesByVault({});
       setUnlockSchedulesByVault({});
+      setUnlockScheduleLoadState("error");
     } finally {
       if (!options?.silent) {
         setLoading(false);
@@ -589,10 +603,6 @@ const Vaults = () => {
               lastProofOfLife: vault.createdAt,
               postDeathUnlocked: false,
             };
-            const unlockStatus = describeEmergencyUnlock(
-              releaseState.emergencyMode,
-              unlockSchedulesByVault[vault.gid]
-            );
             const inactivityDays = Math.max(1, Math.round(releaseState.inactivityPeriod / 86400));
             const isCreator = vault.creator.toLowerCase() === account?.toLowerCase();
             const isGuardian = vault.guardians.some(
@@ -669,13 +679,11 @@ const Vaults = () => {
                     <div className="flex items-center justify-between">
                       <p className="text-xs font-medium text-gray-300">Release Policy</p>
                       <div className="flex gap-1.5">
-                        <Chip
-                          size="sm"
-                          variant="flat"
-                          color={releaseState.emergencyMode ? "warning" : "default"}
-                        >
-                          {unlockStatus.label}
-                        </Chip>
+                        <EmergencyUnlockStatusView
+                          emergencyMode={releaseState.emergencyMode}
+                          schedule={unlockSchedulesByVault[vault.gid]}
+                          loadState={unlockScheduleLoadState}
+                        />
                         <Chip
                           size="sm"
                           variant="flat"
@@ -696,9 +704,6 @@ const Vaults = () => {
                           ? formatDate(releaseState.lastProofOfLife)
                           : "not recorded"}
                       </p>
-                      {unlockStatus.detail && (
-                        <p className="text-amber-200/90">{unlockStatus.detail}</p>
-                      )}
                     </div>
                     {isCreator && (
                       <div className="flex flex-wrap gap-2 pt-1">

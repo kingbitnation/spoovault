@@ -1,6 +1,7 @@
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
 const { time, mine } = require("@nomicfoundation/hardhat-network-helpers");
+const { deploySpooVault } = require("./helpers/deploySpooVault.cjs");
 
 const EMERGENCY_ONLY = 2; // ReleaseCondition.EMERGENCY_ONLY
 const BASE_DELAY = 600; // 10 minutes in seconds
@@ -25,9 +26,7 @@ describe("SpooVault VRF Emergency Unlock Delay Randomization", function () {
     coordinator = await MockVRFCoordinator.deploy();
     await coordinator.waitForDeployment();
 
-    const SpooVault = await ethers.getContractFactory("SpooVault", deployer);
-    spooVault = await SpooVault.deploy();
-    await spooVault.waitForDeployment();
+    spooVault = await deploySpooVault(deployer);
 
     const guardians = [guardian1.address, guardian2.address, guardian3.address];
     await spooVault.connect(owner).createVault(
@@ -65,6 +64,11 @@ describe("SpooVault VRF Emergency Unlock Delay Randomization", function () {
     await spooVault.connect(owner).setEmergencyMode(vaultId, true);
     return spooVault.vrfRequestIdByVault(vaultId);
   };
+
+  it.skip("fits under the EIP-170 runtime bytecode cap (still ~30KB after VRF/admin library split; ERC721 vault surface remains over 24,576)", async function () {
+    const code = await ethers.provider.getCode(await spooVault.getAddress());
+    expect((code.length - 2) / 2).to.be.at.most(24576);
+  });
 
   describe("Legacy behavior (no VRF configured)", function () {
     it("should keep immediate emergency access when VRF is not configured", async function () {

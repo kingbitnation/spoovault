@@ -1,5 +1,6 @@
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
+const { deploySpooVault } = require("./helpers/deploySpooVault.cjs");
 const { time } = require("@nomicfoundation/hardhat-network-helpers");
 
 describe("SpooVault Proactive Secret Resharing (zero-sharing protocol)", function () {
@@ -17,9 +18,7 @@ describe("SpooVault Proactive Secret Resharing (zero-sharing protocol)", functio
   beforeEach(async function () {
     [owner, guardian1, guardian2, guardian3, outsider] = await ethers.getSigners();
 
-    const SpooVault = await ethers.getContractFactory("SpooVault");
-    spooVault = await SpooVault.deploy();
-    await spooVault.waitForDeployment();
+    spooVault = await deploySpooVault();
 
     const guardians = [guardian1.address, guardian2.address, guardian3.address];
     await spooVault.connect(owner).createVault(

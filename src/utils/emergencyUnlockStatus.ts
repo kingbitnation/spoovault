@@ -5,6 +5,8 @@ export interface EmergencyUnlockScheduleView {
   unlockBlock: number;
 }
 
+export type EmergencyUnlockLoadState = "ready" | "loading" | "error";
+
 export interface EmergencyUnlockStatus {
   label: string;
   detail: string | null;
@@ -19,8 +21,27 @@ export interface EmergencyUnlockStatus {
  */
 export const describeEmergencyUnlock = (
   emergencyMode: boolean,
-  schedule: EmergencyUnlockScheduleView | undefined
+  schedule: EmergencyUnlockScheduleView | undefined,
+  loadState: EmergencyUnlockLoadState = "ready"
 ): EmergencyUnlockStatus => {
+  if (loadState === "loading") {
+    return {
+      label: "Loading unlock status",
+      detail:
+        "Fetching the on-chain emergency unlock schedule. Emergency documents stay locked until the contract authorizes release.",
+      claimsUnlocked: false,
+    };
+  }
+
+  if (loadState === "error") {
+    return {
+      label: "Unlock status unavailable",
+      detail:
+        "Could not load the on-chain unlock schedule. Emergency documents stay locked until the contract authorizes release.",
+      claimsUnlocked: false,
+    };
+  }
+
   if (!emergencyMode) {
     return { label: "Emergency OFF", detail: null, claimsUnlocked: false };
   }
