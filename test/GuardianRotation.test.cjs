@@ -1,5 +1,6 @@
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
+const { deploySpooVault } = require("./helpers/deploySpooVault.cjs");
 const { time } = require("@nomicfoundation/hardhat-network-helpers");
 
 describe("SpooVault Guardian Rotation & Threshold Adjustment", function () {
@@ -15,9 +16,7 @@ describe("SpooVault Guardian Rotation & Threshold Adjustment", function () {
     [owner, guardian1, guardian2, guardian3, beneficiary] =
       await ethers.getSigners();
 
-    const SpooVault = await ethers.getContractFactory("SpooVault");
-    spooVault = await SpooVault.deploy();
-    await spooVault.waitForDeployment();
+    spooVault = await deploySpooVault();
 
     // Create a vault with 4 guardians total (owner + 3 external), threshold = 3
     const guardians = [guardian1.address, guardian2.address, guardian3.address];

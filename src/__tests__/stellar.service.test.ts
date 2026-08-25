@@ -377,8 +377,44 @@ describe('stellarService - utility functions', () => {
     expect(stellarService.isConfigured()).toBe(true);
   });
 
-  it('isConfigured should return false when contract address is empty', () => {
+    it('isConfigured should return false when contract address is empty', () => {
     vi.stubEnv('VITE_STELLAR_CONTRACT_ADDRESS', '');
     expect(stellarService.isConfigured()).toBe(false);
+  });
+});
+
+describe('stellarService - emergency unlock delay', () => {
+  beforeEach(async () => {
+    vi.stubEnv('VITE_STELLAR_CONTRACT_ADDRESS', '');
+    stellarService.clear();
+    await stellarService.initialize('');
+    await setupWallet();
+  });
+
+  it('keeps a pending mock schedule until fulfillment', async () => {
+    await stellarService.setEmergencyMode(1, true);
+    const pending = await stellarService.getEmergencyUnlockSchedule(1);
+    expect(pending.requested).toBe(true);
+    expect(pending.fulfilled).toBe(false);
+
+    await expect(stellarService.fulfillEmergencyUnlockDelay(1)).rejects.toThrow(
+      /confirmations not met/i
+    );
+  });
+
+  it('stores dual bounds after mock fulfillment', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    await stellarService.setEmergencyMode(1, true);
+    vi.setSystemTime(new Date('2026-01-01T00:00:16Z'));
+    await stellarService.fulfillEmergencyUnlockDelay(1);
+    vi.useRealTimers();
+
+    const schedule = await stellarService.getEmergencyUnlockSchedule(1);
+    expect(schedule.fulfilled).toBe(true);
+    expect(schedule.unlockAt).toBeGreaterThan(0);
+    expect(schedule.unlockBlock).toBeGreaterThan(0);
+    const state = await stellarService.getReleaseState(1);
+    expect(state.emergencyMode).toBe(true);
   });
 });

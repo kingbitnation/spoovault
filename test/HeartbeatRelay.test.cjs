@@ -1,5 +1,6 @@
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
+const { deploySpooVault } = require("./helpers/deploySpooVault.cjs");
 const { time } = require("@nomicfoundation/hardhat-network-helpers");
 const { anyValue } = require("@nomicfoundation/hardhat-chai-matchers/withArgs");
 
@@ -34,9 +35,7 @@ describe("SpooVault Web3 Keeper Heartbeat Relay", function () {
   beforeEach(async function () {
     [owner, guardian1, keeper, otherKeeper, relayer] = await ethers.getSigners();
 
-    const SpooVault = await ethers.getContractFactory("SpooVault");
-    spooVault = await SpooVault.deploy();
-    await spooVault.waitForDeployment();
+    spooVault = await deploySpooVault();
 
     await spooVault.connect(owner).createVault("Automated Vault", "Desc", [guardian1.address], 1);
     vaultId = 1;

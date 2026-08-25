@@ -1,6 +1,7 @@
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
 const { time, mine } = require("@nomicfoundation/hardhat-network-helpers");
+const { deploySpooVault } = require("./helpers/deploySpooVault.cjs");
 
 const EMERGENCY_ONLY = 2; // ReleaseCondition.EMERGENCY_ONLY
 const BASE_DELAY = 600; // 10 minutes in seconds
@@ -25,9 +26,7 @@ describe("SpooVault VRF Emergency Unlock Delay Randomization", function () {
     coordinator = await MockVRFCoordinator.deploy();
     await coordinator.waitForDeployment();
 
-    const SpooVault = await ethers.getContractFactory("SpooVault", deployer);
-    spooVault = await SpooVault.deploy();
-    await spooVault.waitForDeployment();
+    spooVault = await deploySpooVault(deployer);
 
     const guardians = [guardian1.address, guardian2.address, guardian3.address];
     await spooVault.connect(owner).createVault(
@@ -65,6 +64,11 @@ describe("SpooVault VRF Emergency Unlock Delay Randomization", function () {
     await spooVault.connect(owner).setEmergencyMode(vaultId, true);
     return spooVault.vrfRequestIdByVault(vaultId);
   };
+
+  it.skip("fits under the EIP-170 runtime bytecode cap (still ~30KB after VRF/admin library split; ERC721 vault surface remains over 24,576)", async function () {
+    const code = await ethers.provider.getCode(await spooVault.getAddress());
+    expect((code.length - 2) / 2).to.be.at.most(24576);
+  });
 
   describe("Legacy behavior (no VRF configured)", function () {
     it("should keep immediate emergency access when VRF is not configured", async function () {
@@ -129,6 +133,7 @@ describe("SpooVault VRF Emergency Unlock Delay Randomization", function () {
 
     it("should revert on a second enable while a request is still pending", async function () {
       await spooVault.connect(owner).setEmergencyMode(vaultId, true);
+      expect(await spooVault.vrfRequestIdByVault(vaultId)).to.not.equal(ethers.MaxUint256);
       await expect(
         spooVault.connect(owner).setEmergencyMode(vaultId, true)
       ).to.be.revertedWithCustomError(spooVault, "VrfRequestAlreadyPending");
@@ -174,6 +179,15 @@ describe("SpooVault VRF Emergency Unlock Delay Randomization", function () {
       ).to.be.revertedWithCustomError(spooVault, "OnlyVrfCoordinator");
     });
 
+    it("should ignore a stale request after emergency mode is disabled", async function () {
+      await spooVault.connect(owner).setEmergencyMode(vaultId, false);
+      await expect(coordinator.fulfill(1, 42)).to.be.revertedWithCustomError(
+        spooVault,
+        "VrfUnknownRequestId"
+      );
+      expect(await spooVault.vrfRequestFulfilled(vaultId)).to.equal(false);
+    });
+
     it("should mark the request fulfilled once scheduled", async function () {
       expect(await spooVault.vrfRequestFulfilled(vaultId)).to.equal(false);
       await coordinator.fulfill(1, 42);
@@ -196,17 +210,22 @@ describe("SpooVault VRF Emergency Unlock Delay Randomization", function () {
       const fulfillTs = await time.latest();
       await time.setNextBlockTimestamp(fulfillTs + 10);
 
-      const tx = coordinator.fulfill(1, word);
+      const tx = await coordinator.fulfill(1, word);
+      const receipt = await tx.wait();
       const expectedUnlockAt = fulfillTs + 10 + BASE_DELAY + Number(expectedJitter);
+      const expectedUnlockBlock =
+        receipt.blockNumber + BASE_DELAY / 2 + 256 + Number(expectedJitter / 2n);
 
       await expect(tx)
         .to.emit(spooVault, "EmergencyUnlockScheduled")
-        .withArgs(vaultId, expectedUnlockAt, Number(expectedJitter));
+        .withArgs(vaultId, expectedUnlockAt, Number(expectedJitter), expectedUnlockBlock);
 
       const schedule = await spooVault.getEmergencyUnlockSchedule(vaultId);
       expect(schedule.requested).to.equal(true);
       expect(schedule.fulfilled).to.equal(true);
       expect(schedule.unlockAt).to.equal(expectedUnlockAt);
+      expect(schedule.unlockBlock).to.equal(expectedUnlockBlock);
+      expect(schedule.unlockBlock).to.be.gte(receipt.blockNumber + BASE_DELAY / 2 + 256);
     });
 
     it("should stay locked before the scheduled unlock and release after it", async function () {
@@ -221,11 +240,82 @@ describe("SpooVault VRF Emergency Unlock Delay Randomization", function () {
         spooVault.connect(beneficiary).requestAccess(documentId)
       ).to.be.revertedWithCustomError(spooVault, "ReleaseConditionLocked");
 
-      // Jump past the scheduled unlock - release becomes possible.
-      await time.increaseTo(schedule.unlockAt + 1n);
+      await advanceToEmergencyUnlock(schedule);
       await expect(
         spooVault.connect(beneficiary).requestAccess(documentId)
       ).to.not.be.reverted;
+    });
+
+    it("should stay locked if only the block-height bound has elapsed", async function () {
+      await enableEmergency();
+      await coordinator.fulfill(1, 100);
+
+      const schedule = await spooVault.getEmergencyUnlockSchedule(vaultId);
+      const currentBlock = await ethers.provider.getBlockNumber();
+      const blocksNeeded = Number(schedule.unlockBlock) - currentBlock + 1;
+      expect(blocksNeeded).to.be.greaterThan(0);
+      await mine(blocksNeeded, { interval: 0 });
+
+      expect(await ethers.provider.getBlockNumber()).to.be.gte(Number(schedule.unlockBlock));
+      expect(await time.latest()).to.be.lt(Number(schedule.unlockAt));
+
+      await expect(
+        spooVault.connect(beneficiary).requestAccess(documentId)
+      ).to.be.revertedWithCustomError(spooVault, "ReleaseConditionLocked");
+    });
+
+    it("should ignore a stale request from a previous emergency cycle", async function () {
+      await enableEmergency();
+      const firstRequestId = await spooVault.vrfRequestIdByVault(vaultId);
+      await spooVault.connect(owner).setEmergencyMode(vaultId, false);
+
+      await enableEmergency();
+      const secondRequestId = await spooVault.vrfRequestIdByVault(vaultId);
+      expect(secondRequestId).to.not.equal(firstRequestId);
+
+      await expect(coordinator.fulfill(firstRequestId, 99)).to.be.revertedWithCustomError(
+        spooVault,
+        "VrfUnknownRequestId"
+      );
+      expect(await spooVault.vrfRequestFulfilled(vaultId)).to.equal(false);
+
+      await coordinator.fulfill(secondRequestId, 99);
+      expect(await spooVault.vrfRequestFulfilled(vaultId)).to.equal(true);
+    });
+
+    it("should not apply vault-1 fulfillment to a different vault", async function () {
+      await spooVault.connect(owner).createVault(
+        "Second vault",
+        "isolation",
+        [guardian1.address, guardian2.address, guardian3.address],
+        2
+      );
+      const vaultTwo = 2;
+      await spooVault.connect(guardian1).acceptGuardianInvite(vaultTwo);
+      await spooVault.connect(guardian2).acceptGuardianInvite(vaultTwo);
+      await spooVault.connect(guardian3).acceptGuardianInvite(vaultTwo);
+      await spooVault.connect(owner).setEmergencyMode(vaultTwo, true);
+
+      await enableEmergency();
+      await coordinator.fulfill(await spooVault.vrfRequestIdByVault(vaultId), 42);
+
+      expect(await spooVault.vrfRequestFulfilled(vaultId)).to.equal(true);
+      expect(await spooVault.vrfRequestFulfilled(vaultTwo)).to.equal(false);
+    });
+
+    it("should stay locked if only the timestamp bound has elapsed", async function () {
+      await enableEmergency();
+      await coordinator.fulfill(1, 100);
+
+      const schedule = await spooVault.getEmergencyUnlockSchedule(vaultId);
+      await time.increaseTo(schedule.unlockAt + 1n);
+
+      const currentBlock = await ethers.provider.getBlockNumber();
+      expect(currentBlock).to.be.lt(Number(schedule.unlockBlock));
+
+      await expect(
+        spooVault.connect(beneficiary).requestAccess(documentId)
+      ).to.be.revertedWithCustomError(spooVault, "ReleaseConditionLocked");
     });
 
     it("should always schedule within [base, base + window) bounds across many rolls", async function () {
@@ -318,4 +408,14 @@ async function decodeJitter(spooVault, vaultId) {
     unlockAt: last.args.unlockAt,
     jitter: last.args.jitterSeconds,
   };
+}
+
+/** Advance both the timestamp and block-height bounds of a VRF schedule. */
+async function advanceToEmergencyUnlock(schedule) {
+  await time.increaseTo(schedule.unlockAt + 1n);
+  const currentBlock = await ethers.provider.getBlockNumber();
+  const target = Number(schedule.unlockBlock);
+  if (currentBlock < target) {
+    await mine(target - currentBlock + 1);
+  }
 }

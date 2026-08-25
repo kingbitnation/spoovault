@@ -2,6 +2,8 @@ import { expect } from "chai";
 import hre from "hardhat";
 const { ethers } = hre;
 import { time, mine } from "@nomicfoundation/hardhat-network-helpers";
+import { createRequire } from "module";
+const { deploySpooVault } = createRequire(import.meta.url)("./helpers/deploySpooVault.cjs");
 
 describe("SpooVault EVM Contract Unit Tests", function () {
   let spooVault;
@@ -13,9 +15,7 @@ describe("SpooVault EVM Contract Unit Tests", function () {
   beforeEach(async function () {
     [owner, guardian1, guardian2, beneficiary] = await ethers.getSigners();
 
-    const SpooVault = await ethers.getContractFactory("SpooVault");
-    spooVault = await SpooVault.deploy();
-    await spooVault.waitForDeployment();
+    spooVault = await deploySpooVault();
   });
 
   describe("Public Key Registry", function () {

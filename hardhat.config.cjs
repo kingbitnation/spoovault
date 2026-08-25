@@ -16,7 +16,7 @@ module.exports = {
       viaIR: true,
       optimizer: {
         enabled: true,
-        runs: 200,
+        runs: 1,
       },
       // Dropping the CBOR metadata hash from deployed bytecode buys back size
       // margin against the EIP-170 24,576-byte contract-size limit at zero

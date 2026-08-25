@@ -131,6 +131,21 @@ pub struct VaultReleaseState {
     pub last_proof_of_life_sequence: u32,
 }
 
+/// VRF/PRNG-backed emergency unlock bounds. Requested when emergency mode
+/// is enabled; fulfilled after `MIN_EMERGENCY_UNLOCK_CONFIRMATIONS` ledgers
+/// using `env.prng()` so neither validators nor guardians can pick the
+/// exact unlock ledger in advance.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct EmergencyUnlockSchedule {
+    pub cycle: u64,
+    pub request_sequence: u32,
+    pub fulfilled: bool,
+    pub unlock_at: u64,
+    pub unlock_sequence: u32,
+    pub jitter_seconds: u64,
+}
+
 /// Footprint-optimization: a vault's configuration and its release state
 /// used to live under two separate persistent keys (`DataKey::Vault` and
 /// `DataKey::ReleaseState`), even though almost every entrypoint that reads
@@ -163,6 +178,22 @@ pub struct VaultRecord {
 /// their permitted drift window to trigger an early release without real
 /// ledger progression having occurred.
 const MIN_POST_DEATH_SEQUENCE_DELTA: u32 = 256;
+
+/// Base delay applied after emergency-mode PRNG fulfillment, matching the
+/// EVM `EMERGENCY_UNLOCK_BASE_DELAY` so observers cannot predict the exact
+/// ledger at which post-death / emergency documents become readable.
+const EMERGENCY_UNLOCK_BASE_DELAY: u64 = 10 * 60;
+const DEFAULT_EMERGENCY_JITTER_WINDOW: u64 = 60 * 60;
+const MIN_JITTER_WINDOW: u64 = 5 * 60;
+const MAX_JITTER_WINDOW: u64 = 7 * 24 * 60 * 60;
+/// Ledgers that must close between the emergency-mode request and PRNG
+/// fulfillment so the triggering party cannot grind the same ledger's seed.
+const MIN_EMERGENCY_UNLOCK_CONFIRMATIONS: u32 = 3;
+/// Minimum ledger progression after fulfillment before emergency unlock.
+const MIN_EMERGENCY_UNLOCK_SEQUENCE_DELTA: u32 = 256;
+/// Stellar ledger close time used to convert jitter seconds into extra
+/// required sequence delta.
+const EMERGENCY_SECONDS_PER_LEDGER: u64 = 5;
 
 /// A Web3 Keeper (Chainlink Automation / Gelato) delegation: `keeper` may relay
 /// proof-of-life heartbeats on the vault creator's behalf until `expires_at`.
@@ -232,6 +263,9 @@ pub enum DataKey {
     FheAccumulator(u64),
     FheAccumulatorCount(u64),
     DocReleaseCond(u64),
+    EmergencyUnlock(u64),
+    EmergencyJitterWindow(u64),
+    EmergencyUnlockCycle(u64),
     KeeperAuth(u64),
     // Optional external registry contract notified on document access grants
     AccessRegistry(u64),
@@ -922,7 +956,7 @@ impl SpooVaultStellar {
             .unwrap_or(ReleaseCondition::Anytime);
 
         assert!(
-            Self::is_release_condition_satisfied(&env, &record.release_state, cond),
+            Self::is_release_condition_satisfied(&env, doc.vault_id, &record.release_state, cond),
             "Release condition locked"
         );
 
@@ -1677,6 +1711,151 @@ impl SpooVaultStellar {
 
         record.release_state.emergency_mode = enabled;
         Self::save_vault_record(&env, vault_id, &record);
+
+        let schedule_key = DataKey::EmergencyUnlock(vault_id);
+        if enabled {
+            if let Some(existing) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, EmergencyUnlockSchedule>(&schedule_key)
+            {
+                assert!(
+                    existing.fulfilled,
+                    "Emergency unlock delay already pending"
+                );
+            }
+            let cycle_key = DataKey::EmergencyUnlockCycle(vault_id);
+            let cycle: u64 = env
+                .storage()
+                .persistent()
+                .get(&cycle_key)
+                .unwrap_or(0u64)
+                .saturating_add(1);
+            env.storage().persistent().set(&cycle_key, &cycle);
+            Self::bump_persistent(&env, &cycle_key);
+
+            let schedule = EmergencyUnlockSchedule {
+                cycle,
+                request_sequence: env.ledger().sequence(),
+                fulfilled: false,
+                unlock_at: 0,
+                unlock_sequence: 0,
+                jitter_seconds: 0,
+            };
+            env.storage().persistent().set(&schedule_key, &schedule);
+            Self::bump_persistent(&env, &schedule_key);
+            env.events().publish(
+                (Symbol::new(&env, "emergency_unlock_requested"), vault_id),
+                env.ledger().sequence(),
+            );
+        } else {
+            env.storage().persistent().remove(&schedule_key);
+        }
+    }
+
+    /// Vault creator tunes Delta_T used to scale the PRNG offset:
+    /// `T_random = PRNG() mod Delta_T`.
+    pub fn set_emergency_jitter_window(env: Env, owner: Address, vault_id: u64, jitter_window: u64) {
+        owner.require_auth();
+        Self::bump_instance(&env);
+
+        let record = Self::load_vault_record(&env, vault_id);
+        assert!(
+            record.vault.creator == owner,
+            "Only creator can set emergency jitter window"
+        );
+        assert!(
+            (MIN_JITTER_WINDOW..=MAX_JITTER_WINDOW).contains(&jitter_window),
+            "Invalid jitter window"
+        );
+
+        let window_key = DataKey::EmergencyJitterWindow(vault_id);
+        env.storage().persistent().set(&window_key, &jitter_window);
+        Self::bump_persistent(&env, &window_key);
+        Self::bump_persistent(&env, &DataKey::Vault(vault_id));
+        env.events().publish(
+            (Symbol::new(&env, "emergency_jitter_window"), vault_id),
+            jitter_window,
+        );
+    }
+
+    /// Permissionless fulfillment: after the request has sat for
+    /// `MIN_EMERGENCY_UNLOCK_CONFIRMATIONS` ledgers, sample Soroban PRNG
+    /// entropy and write the un-manipulable unlock timestamp + sequence.
+    pub fn fulfill_emergency_unlock_delay(env: Env, vault_id: u64) {
+        Self::bump_instance(&env);
+
+        let record = Self::load_vault_record(&env, vault_id);
+        assert!(
+            record.release_state.emergency_mode,
+            "Emergency mode is not enabled"
+        );
+
+        let schedule_key = DataKey::EmergencyUnlock(vault_id);
+        let mut schedule: EmergencyUnlockSchedule = env
+            .storage()
+            .persistent()
+            .get(&schedule_key)
+            .expect("No emergency unlock request");
+        assert!(!schedule.fulfilled, "Emergency unlock already fulfilled");
+        let current_cycle: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmergencyUnlockCycle(vault_id))
+            .unwrap_or(0);
+        assert!(schedule.cycle == current_cycle && schedule.cycle != 0, "Stale emergency unlock request");
+        assert!(
+            env.ledger().sequence()
+                >= schedule.request_sequence + MIN_EMERGENCY_UNLOCK_CONFIRMATIONS,
+            "Emergency unlock confirmations not met"
+        );
+
+        let window: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmergencyJitterWindow(vault_id))
+            .unwrap_or(DEFAULT_EMERGENCY_JITTER_WINDOW);
+        assert!(window > 0, "Invalid jitter window");
+        let word: u64 = env.prng().gen();
+        let jitter = word % window;
+        let extra_ledgers = (jitter / EMERGENCY_SECONDS_PER_LEDGER) as u32;
+        let base_delay_ledgers = (EMERGENCY_UNLOCK_BASE_DELAY / EMERGENCY_SECONDS_PER_LEDGER) as u32;
+
+        schedule.fulfilled = true;
+        schedule.jitter_seconds = jitter;
+        schedule.unlock_at = env.ledger().timestamp() + EMERGENCY_UNLOCK_BASE_DELAY + jitter;
+        schedule.unlock_sequence = env
+            .ledger()
+            .sequence()
+            .saturating_add(base_delay_ledgers)
+            .saturating_add(MIN_EMERGENCY_UNLOCK_SEQUENCE_DELTA)
+            .saturating_add(extra_ledgers);
+
+        env.storage().persistent().set(&schedule_key, &schedule);
+        Self::bump_persistent(&env, &schedule_key);
+        Self::bump_persistent(&env, &DataKey::Vault(vault_id));
+
+        env.events().publish(
+            (Symbol::new(&env, "emergency_unlock_scheduled"), vault_id),
+            (
+                schedule.unlock_at,
+                schedule.unlock_sequence,
+                schedule.jitter_seconds,
+            ),
+        );
+    }
+
+    pub fn get_emergency_unlock_schedule(
+        env: Env,
+        vault_id: u64,
+    ) -> Option<EmergencyUnlockSchedule> {
+        Self::bump_instance(&env);
+        let key = DataKey::EmergencyUnlock(vault_id);
+        let schedule: Option<EmergencyUnlockSchedule> = env.storage().persistent().get(&key);
+        if schedule.is_some() {
+            Self::bump_persistent(&env, &key);
+        }
+        schedule
     }
 
     /// Configure an optional external registry contract to be notified whenever
@@ -1857,6 +2036,7 @@ impl SpooVaultStellar {
     /// don't pay for a second, redundant storage read of the same key.
     fn is_release_condition_satisfied(
         env: &Env,
+        vault_id: u64,
         state: &VaultReleaseState,
         condition: ReleaseCondition,
     ) -> bool {
@@ -1872,7 +2052,15 @@ impl SpooVaultStellar {
 
         match condition {
             ReleaseCondition::LiveOnly => !is_dead,
-            ReleaseCondition::EmergencyOnly => state.emergency_mode || is_dead,
+            ReleaseCondition::EmergencyOnly => {
+                if is_dead {
+                    true
+                } else if !state.emergency_mode {
+                    false
+                } else {
+                    Self::is_emergency_unlock_mature(env, vault_id)
+                }
+            }
             ReleaseCondition::PostDeathOnly => is_dead,
             _ => false,
         }
@@ -2253,6 +2441,19 @@ impl SpooVaultStellar {
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
+    }
+
+    fn is_emergency_unlock_mature(env: &Env, vault_id: u64) -> bool {
+        let Some(schedule) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, EmergencyUnlockSchedule>(&DataKey::EmergencyUnlock(vault_id))
+        else {
+            return false;
+        };
+        schedule.fulfilled
+            && env.ledger().timestamp() >= schedule.unlock_at
+            && env.ledger().sequence() >= schedule.unlock_sequence
     }
 
     // Helper functions for the packed vault+release-state storage record

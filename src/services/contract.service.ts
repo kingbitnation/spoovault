@@ -89,6 +89,13 @@ export interface VaultReleaseState {
   postDeathUnlocked: boolean;
 }
 
+export interface EmergencyUnlockSchedule {
+  requested: boolean;
+  fulfilled: boolean;
+  unlockAt: number;
+  unlockBlock: number;
+}
+
 export interface KeeperAuthorizationData {
   keeper: string;
   expiresAt: number;
@@ -109,6 +116,8 @@ const CONTRACT_ABI = [
   "function keeperAuthNonces(uint256 vaultId) external view returns (uint256)",
   "function getVaultGID(uint256 vaultId) external view returns (string)",
   "function setEmergencyMode(uint256 vaultId, bool enabled) external",
+  "function getEmergencyUnlockSchedule(uint256 vaultId) external view returns (bool requested, bool fulfilled, uint256 unlockAt, uint256 unlockBlock)",
+  "function getVrfConfig() external view returns (address coordinator, bytes32 keyHash, uint256 subscriptionId, uint32 callbackGasLimit, uint16 minimumRequestConfirmations)",
   "function setBeneficiary(uint256 vaultId, address beneficiary) external",
   "function getBeneficiary(uint256 vaultId) external view returns (address)",
   "function getVaultReleaseState(uint256 vaultId) external view returns (bool emergencyMode, uint256 inactivityPeriod, uint256 lastProofOfLife, bool postDeathUnlocked)",
@@ -116,6 +125,10 @@ const CONTRACT_ABI = [
   "function requestAccess(uint256 documentId) external returns (uint256)",
   "function approveAccess(uint256 requestId) external",
   "function approveAccess(uint256 requestId, string encryptedShareForBeneficiary) external",
+  "function verifyDelegation(address guardian, address delegate, uint256 vaultId, uint256 validUntil, uint256 nonce, bytes signature) external view",
+  "function revokeDelegation(uint256 nonce) external",
+  "function approveAccessByDelegation(uint256 requestId, address guardian, uint256 validUntil, uint256 nonce, bytes signature, string encryptedShareForBeneficiary) external",
+  "function revokedNonces(address guardian, uint256 nonce) external view returns (bool)",
   "function acceptGuardianInvite(uint256 vaultId) external",
   "function accessRequests(uint256 requestId) external view returns (uint256 requestId, uint256 documentId, address requester, uint8 status, uint256 expiresAt, uint256 createdAt)",
   "function latestRequestId(uint256 documentId, address user) external view returns (uint256)",
@@ -152,6 +165,7 @@ const CONTRACT_ABI = [
   "event KeeperAuthorized(uint256 indexed vaultId, address indexed owner, address indexed keeper, uint256 expiresAt)",
   "event KeeperRevoked(uint256 indexed vaultId, address indexed owner)",
   "event ProofOfLifeRelayed(uint256 indexed vaultId, address indexed owner, address indexed keeper, uint256 timestamp)",
+  "event DelegationNonceRevoked(address indexed guardian, uint256 indexed nonce)",
 ];
 
 const KEEPER_AUTHORIZATION_EIP712_TYPES = {
@@ -159,6 +173,16 @@ const KEEPER_AUTHORIZATION_EIP712_TYPES = {
     { name: "vaultId", type: "uint256" },
     { name: "keeper", type: "address" },
     { name: "expiresAt", type: "uint256" },
+    { name: "nonce", type: "uint256" },
+  ],
+};
+
+const GUARDIAN_DELEGATION_EIP712_TYPES = {
+  GuardianDelegation: [
+    { name: "guardian", type: "address" },
+    { name: "delegate", type: "address" },
+    { name: "vaultId", type: "uint256" },
+    { name: "validUntil", type: "uint256" },
     { name: "nonce", type: "uint256" },
   ],
 };
@@ -858,6 +882,75 @@ const approveAccess = async (requestId: number, encryptedShareForBeneficiary?: s
   await waitForReceipt(tx);
 };
 
+/**
+ * Guardian signs an EIP-712 "GuardianDelegation" message off-chain, authorizing
+ * `delegate` to submit access approvals on their behalf until `validUntil`.
+ */
+const signGuardianDelegation = async (
+  guardian: string,
+  delegate: string,
+  vaultId: number,
+  validUntil: number,
+  nonce: number
+): Promise<string> => {
+  const contract = ensureWriteContract();
+  const signer = contract.runner;
+  if (!signer || typeof (signer as ethers.Signer).signTypedData !== "function") {
+    throw new Error("A connected wallet signer is required to delegate guardian approval.");
+  }
+
+  const domain = {
+    name: "SpooVault",
+    version: "1",
+    chainId: getConfiguredChainId(),
+    verifyingContract: getContractAddress(),
+  };
+
+  return (signer as ethers.Signer).signTypedData(domain, GUARDIAN_DELEGATION_EIP712_TYPES, {
+    guardian,
+    delegate,
+    vaultId,
+    validUntil,
+    nonce,
+  });
+};
+
+/**
+ * Delegate submits an access approval on behalf of `guardian` using a signed
+ * EIP-712 GuardianDelegation grant.
+ */
+const approveAccessByDelegation = async (
+  requestId: number,
+  guardian: string,
+  validUntil: number,
+  nonce: number,
+  signature: string,
+  encryptedShareForBeneficiary?: string
+): Promise<void> => {
+  const contract = ensureWriteContract();
+  if (!contractHasFunction(contract, "approveAccessByDelegation(uint256,address,uint256,uint256,bytes,string)")) {
+    throw new Error("Current contract does not support guardian delegation.");
+  }
+  const tx = await contract.approveAccessByDelegation(
+    requestId,
+    guardian,
+    validUntil,
+    nonce,
+    signature,
+    encryptedShareForBeneficiary ?? ""
+  );
+  await waitForReceipt(tx);
+};
+
+const revokeDelegation = async (nonce: number): Promise<void> => {
+  const contract = ensureWriteContract();
+  if (!contractHasFunction(contract, "revokeDelegation(uint256)")) {
+    throw new Error("Current contract does not support guardian delegation.");
+  }
+  const tx = await contract.revokeDelegation(nonce);
+  await waitForReceipt(tx);
+};
+
 const registerGuardianBLSKey = async (
   vaultId: number,
   blsPublicKey: string,
@@ -1299,6 +1392,9 @@ const getDocumentReleaseConditionMap = async (
 };
 
 const getVaultReleaseState = async (vaultId: number): Promise<VaultReleaseState> => {
+  if (getEcosystem() === "stellar") {
+    return stellarService.getReleaseState(vaultId);
+  }
   await ensureContractDeployed();
   const contract = ensureReadContract();
 
@@ -1340,6 +1436,42 @@ const fetchVaultReleaseStates = async (
   return Object.fromEntries(entries);
 };
 
+const fetchEmergencyUnlockSchedules = async (
+  vaultIds: number[]
+): Promise<Record<number, EmergencyUnlockSchedule>> => {
+  if (vaultIds.length === 0) {
+    return {};
+  }
+
+  if (getEcosystem() === "stellar") {
+    const entries = await Promise.all(
+      vaultIds.map(async (vaultId) => {
+        let schedule = await stellarService.getEmergencyUnlockSchedule(vaultId);
+        if (
+          !stellarService.isConfigured() &&
+          schedule.requested &&
+          !schedule.fulfilled
+        ) {
+          try {
+            await stellarService.fulfillEmergencyUnlockDelay(vaultId);
+            schedule = await stellarService.getEmergencyUnlockSchedule(vaultId);
+          } catch {
+            // Mock confirmation window has not elapsed yet.
+          }
+        }
+        return [vaultId, schedule] as const;
+      })
+    );
+    return Object.fromEntries(entries);
+  }
+
+  const entries = await Promise.all(
+    vaultIds.map(async (vaultId) => [vaultId, await getEmergencyUnlockSchedule(vaultId)] as const)
+  );
+
+  return Object.fromEntries(entries);
+};
+
 const configureVaultRelease = async (
   vaultId: number,
   inactivityPeriod: number
@@ -1373,13 +1505,55 @@ const getVaultGID = async (vaultId: number): Promise<string> => {
   return String(await readContract.getVaultGID(vaultId));
 };
 
+const getEmergencyUnlockSchedule = async (
+  vaultId: number
+): Promise<EmergencyUnlockSchedule> => {
+  if (getEcosystem() === "stellar") {
+    return stellarService.getEmergencyUnlockSchedule(vaultId);
+  }
+  await ensureContractDeployed();
+  const contract = ensureReadContract();
+  const empty: EmergencyUnlockSchedule = {
+    requested: false,
+    fulfilled: false,
+    unlockAt: 0,
+    unlockBlock: 0,
+  };
+
+  if (!contractHasFunction(contract, "getEmergencyUnlockSchedule(uint256)")) {
+    return empty;
+  }
+
+  try {
+    const value = await contract.getEmergencyUnlockSchedule(vaultId);
+    return {
+      requested: Boolean(value[0]),
+      fulfilled: Boolean(value[1]),
+      unlockAt: Number(value[2]),
+      unlockBlock: Number(value[3]),
+    };
+  } catch {
+    return empty;
+  }
+};
+
 const setEmergencyMode = async (vaultId: number, enabled: boolean): Promise<void> => {
+  if (getEcosystem() === "stellar") {
+    await stellarService.setEmergencyMode(vaultId, enabled);
+    return;
+  }
   const contract = ensureWriteContract();
   if (!contractHasFunction(contract, "setEmergencyMode(uint256,bool)")) {
     throw new Error("Current contract does not support emergency mode controls.");
   }
   const tx = await contract.setEmergencyMode(vaultId, enabled);
   await waitForReceipt(tx);
+};
+
+const fulfillEmergencyUnlockDelay = async (vaultId: number): Promise<void> => {
+  if (getEcosystem() === "stellar") {
+    await stellarService.fulfillEmergencyUnlockDelay(vaultId);
+  }
 };
 
 const setBeneficiary = async (vaultId: number, beneficiary: string): Promise<void> => {
@@ -2272,10 +2446,13 @@ export const contractService = {
   getDocumentReleaseConditionMap,
   getVaultReleaseState,
   fetchVaultReleaseStates,
+  fetchEmergencyUnlockSchedules,
   configureVaultRelease,
   recordProofOfLife,
   getVaultGID,
   setEmergencyMode,
+  fulfillEmergencyUnlockDelay,
+  getEmergencyUnlockSchedule,
   setBeneficiary,
   getBeneficiary,
   signKeeperAuthorization,
@@ -2285,6 +2462,9 @@ export const contractService = {
   getKeeperAuthorization,
   fetchPendingApprovalsForGuardian: proxiedFetchPendingApprovalsForGuardian,
   getRecentActivity,
+  signGuardianDelegation,
+  approveAccessByDelegation,
+  revokeDelegation,
   registerPublicKey: proxiedRegisterPublicKey,
   getUserPublicKey: proxiedGetUserPublicKey,
   getEncryptedGuardianShare: proxiedGetEncryptedGuardianShare,

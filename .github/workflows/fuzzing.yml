@@ -166,7 +166,7 @@ jobs:
       # (256 generated sequences per run; see docs/TESTING.md).
       - name: Run Soroban contract test suite
         working-directory: contracts-stellar
-        run: cargo +stable test
+        run: cargo +stable test --features upgrade-tests
 
       - name: Install cargo-fuzz
         run: cargo +nightly install cargo-fuzz --locked

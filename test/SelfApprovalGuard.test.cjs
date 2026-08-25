@@ -1,5 +1,6 @@
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
+const { deploySpooVault } = require("./helpers/deploySpooVault.cjs");
 const { time } = require("@nomicfoundation/hardhat-network-helpers");
 
 const ONE_DAY = 24 * 60 * 60;
@@ -17,9 +18,7 @@ describe("SpooVault Self-Approval Guard", function () {
     [owner, guardian1, guardian2, beneficiary, outsider] =
       await ethers.getSigners();
 
-    const SpooVault = await ethers.getContractFactory("SpooVault");
-    spooVault = await SpooVault.deploy();
-    await spooVault.waitForDeployment();
+    spooVault = await deploySpooVault();
   });
 
   async function createVault(threshold, guardians) {

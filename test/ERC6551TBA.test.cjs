@@ -21,6 +21,7 @@
 
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
+const { deploySpooVault } = require("./helpers/deploySpooVault.cjs");
 
 describe("ERC-6551 Token Bound Accounts", function () {
   let registry;
@@ -51,8 +52,7 @@ describe("ERC-6551 Token Bound Accounts", function () {
     await implementation.waitForDeployment();
 
     // Deploy SpooVault and create a vault so owner receives a vault NFT
-    const SpooVault = await ethers.getContractFactory("SpooVault");
-    spooVault = await SpooVault.deploy();
+    spooVault = await deploySpooVault();
     await spooVault.waitForDeployment();
 
     // Create vault: owner + guardian1 → threshold 1

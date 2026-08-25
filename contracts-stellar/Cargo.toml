@@ -19,6 +19,12 @@ sha3 = "0.10.8"
 # Property-based random state-sequence fuzzing (src/fuzz_test.rs).
 proptest = "1.5.0"
 
+[features]
+# Compiles `upgrade_contract` integration tests that `contractimport!` the
+# upgrade_fixture Wasm. CI builds that artifact first, then enables this
+# feature. Local `cargo test` stays usable without the Wasm.
+upgrade-tests = []
+
 [profile.release]
 opt-level = "z"
 overflow-checks = true

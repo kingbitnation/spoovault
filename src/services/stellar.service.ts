@@ -1332,6 +1332,172 @@ interface MockKeeperAuthorization {
   expiresAt: number;
 }
 
+interface MockEmergencyUnlock {
+  emergencyMode: boolean;
+  cycle: number;
+  requestedAt: number;
+  requested: boolean;
+  fulfilled: boolean;
+  unlockAt: number;
+  unlockBlock: number;
+}
+
+const MOCK_EMERGENCY_CONFIRMATION_MS = 15_000;
+const MOCK_EMERGENCY_BASE_DELAY_SEC = 600;
+const MOCK_EMERGENCY_WINDOW_SEC = 3600;
+
+const loadEmergencyUnlocks = (): Record<number, MockEmergencyUnlock> =>
+  getMockStorage<Record<number, MockEmergencyUnlock>>("emergency_unlocks", {});
+
+const setEmergencyMode = async (vaultId: number, enabled: boolean): Promise<void> => {
+  if (!activeAccount) throw new Error("Wallet not connected");
+
+  if (isConfigured()) {
+    await executeSorobanCall("set_emergency_mode", [activeAccount, vaultId, enabled]);
+    return;
+  }
+
+  const schedules = loadEmergencyUnlocks();
+  if (enabled) {
+    const existing = schedules[vaultId];
+    if (existing?.requested && !existing.fulfilled) {
+      throw new Error("Emergency unlock delay already pending");
+    }
+    schedules[vaultId] = {
+      emergencyMode: true,
+      cycle: (existing?.cycle || 0) + 1,
+      requestedAt: Date.now(),
+      requested: true,
+      fulfilled: false,
+      unlockAt: 0,
+      unlockBlock: 0,
+    };
+  } else if (schedules[vaultId]) {
+    schedules[vaultId] = {
+      ...schedules[vaultId],
+      emergencyMode: false,
+      requested: false,
+      fulfilled: false,
+      unlockAt: 0,
+      unlockBlock: 0,
+    };
+  } else {
+    schedules[vaultId] = {
+      emergencyMode: false,
+      cycle: 0,
+      requestedAt: 0,
+      requested: false,
+      fulfilled: false,
+      unlockAt: 0,
+      unlockBlock: 0,
+    };
+  }
+  saveMockStorage("emergency_unlocks", schedules);
+};
+
+const fulfillEmergencyUnlockDelay = async (vaultId: number): Promise<void> => {
+  if (isConfigured()) {
+    await executeSorobanCall("fulfill_emergency_unlock_delay", [vaultId]);
+    return;
+  }
+
+  const schedules = loadEmergencyUnlocks();
+  const schedule = schedules[vaultId];
+  if (!schedule?.emergencyMode) {
+    throw new Error("Emergency mode is not enabled");
+  }
+  if (!schedule.requested || schedule.fulfilled) {
+    throw new Error("No emergency unlock request");
+  }
+  if (Date.now() < schedule.requestedAt + MOCK_EMERGENCY_CONFIRMATION_MS) {
+    throw new Error("Emergency unlock confirmations not met");
+  }
+
+  const jitter = Math.floor(Math.random() * MOCK_EMERGENCY_WINDOW_SEC);
+  const nowSec = Math.floor(Date.now() / 1000);
+  schedules[vaultId] = {
+    ...schedule,
+    fulfilled: true,
+    unlockAt: nowSec + MOCK_EMERGENCY_BASE_DELAY_SEC + jitter,
+    unlockBlock: nowSec + 256 + Math.floor(jitter / 5),
+  };
+  saveMockStorage("emergency_unlocks", schedules);
+};
+
+const getEmergencyUnlockSchedule = async (
+  vaultId: number
+): Promise<{
+  requested: boolean;
+  fulfilled: boolean;
+  unlockAt: number;
+  unlockBlock: number;
+}> => {
+  const empty = { requested: false, fulfilled: false, unlockAt: 0, unlockBlock: 0 };
+
+  if (isConfigured()) {
+    try {
+      const result = await executeSorobanQuery("get_emergency_unlock_schedule", [vaultId]);
+      if (!result) return empty;
+      return {
+        requested: true,
+        fulfilled: Boolean(result.fulfilled),
+        unlockAt: Number(result.unlock_at ?? 0),
+        unlockBlock: Number(result.unlock_sequence ?? 0),
+      };
+    } catch (err) {
+      console.error("Soroban get_emergency_unlock_schedule failed:", err);
+      return empty;
+    }
+  }
+
+  const schedule = loadEmergencyUnlocks()[vaultId];
+  if (!schedule) return empty;
+  return {
+    requested: Boolean(schedule.requested),
+    fulfilled: Boolean(schedule.fulfilled),
+    unlockAt: Number(schedule.unlockAt || 0),
+    unlockBlock: Number(schedule.unlockBlock || 0),
+  };
+};
+
+const getReleaseState = async (
+  vaultId: number
+): Promise<{
+  emergencyMode: boolean;
+  inactivityPeriod: number;
+  lastProofOfLife: number;
+  postDeathUnlocked: boolean;
+}> => {
+  const fallback = {
+    emergencyMode: false,
+    inactivityPeriod: 30 * 24 * 60 * 60,
+    lastProofOfLife: 0,
+    postDeathUnlocked: false,
+  };
+
+  if (isConfigured()) {
+    try {
+      const result = await executeSorobanQuery("get_release_state", [vaultId]);
+      if (!result) return fallback;
+      return {
+        emergencyMode: Boolean(result.emergency_mode),
+        inactivityPeriod: Number(result.inactivity_period ?? fallback.inactivityPeriod),
+        lastProofOfLife: Number(result.last_proof_of_life ?? 0),
+        postDeathUnlocked: false,
+      };
+    } catch (err) {
+      console.error("Soroban get_release_state failed:", err);
+      return fallback;
+    }
+  }
+
+  const schedule = loadEmergencyUnlocks()[vaultId];
+  return {
+    ...fallback,
+    emergencyMode: Boolean(schedule?.emergencyMode),
+  };
+};
+
 /**
  * Authorize a Web3 Keeper (Chainlink Automation / Gelato) to relay proof-of-life
  * heartbeats for `vaultId` until `expiresAt`. Soroban's native `require_auth`
@@ -1703,6 +1869,10 @@ export const stellarService = {
   revokeKeeperAuthorization,
   getKeeperAuthorization,
   relayProofOfLifeAsKeeper,
+  setEmergencyMode,
+  fulfillEmergencyUnlockDelay,
+  getEmergencyUnlockSchedule,
+  getReleaseState,
   buildIdentityBindingMessageHash,
   signIdentityBindingWithMetaMask,
   signIdentityBindingWithFreighter,

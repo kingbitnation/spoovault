@@ -71,6 +71,7 @@ jobs:
       - name: Run cargo-tarpaulin
         run: |
           cargo tarpaulin \
+            --features upgrade-tests \
             --engine llvm \
             --out Xml --out Html \
             --output-dir ../coverage \
