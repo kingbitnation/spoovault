@@ -206,6 +206,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     error ZeroShareAlreadySubmitted();
     error InvalidShareRefreshInput();
     error InvalidReshareDuration();
+    error DelegationInvalidOrExpired();
     error InvalidBLSKeyLength();
     error InvalidProofOfPossession();
     error GuardianBLSKeyNotRegistered();
@@ -330,6 +331,18 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     mapping(uint256 => KeeperAuthorization) public keeperAuthorizations;
     mapping(uint256 => uint256) public keeperAuthNonces;
 
+    struct GuardianDelegation {
+        address guardian;
+        address delegate;
+        uint256 vaultId;
+        uint256 validUntil;
+        uint256 nonce;
+    }
+
+    bytes32 private constant GUARDIAN_DELEGATION_TYPEHASH =
+        keccak256("GuardianDelegation(address guardian,address delegate,uint256 vaultId,uint256 validUntil,uint256 nonce)");
+    mapping(address => mapping(uint256 => bool)) public revokedNonces;
+
     // ------------------------------------------------------------------
     // Proactive Secret Sharing (PSS) state.
     //
@@ -394,6 +407,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
     event VaultReconfigurationExecuted(uint256 indexed vaultId, address indexed guardianRemoved, uint256 newThreshold);
     event KeeperAuthorized(uint256 indexed vaultId, address indexed owner, address indexed keeper, uint256 expiresAt);
     event KeeperRevoked(uint256 indexed vaultId, address indexed owner);
+    event DelegationNonceRevoked(address indexed guardian, uint256 indexed nonce);
     event ProofOfLifeRelayed(uint256 indexed vaultId, address indexed owner, address indexed keeper, uint256 timestamp);
     event ShareRefreshStarted(uint256 indexed documentId, uint256 indexed epoch, uint256 deadline);
     event ZeroShareCommitmentSubmitted(uint256 indexed documentId, uint256 indexed epoch, address indexed guardian, uint256 degree);
@@ -1493,7 +1507,7 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
      * @dev Approve an access request (accepted guardian only, never the requester).
      */
     function approveAccess(uint256 requestId) external nonReentrant {
-        _approveAccess(requestId, "");
+        _approveAccess(requestId, "", msg.sender);
     }
 
     /**
@@ -1502,7 +1516,112 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
      * distinct accepted guardians other than the requester.
      */
     function approveAccess(uint256 requestId, string calldata encryptedShareForBeneficiary) external nonReentrant {
-        _approveAccess(requestId, encryptedShareForBeneficiary);
+        _approveAccess(requestId, encryptedShareForBeneficiary, msg.sender);
+    }
+
+    /**
+     * @dev Instantly invalidate a previously signed {GuardianDelegation} nonce.
+     *      Only the guardian who issued the nonce can revoke it.
+     */
+    function revokeDelegation(uint256 nonce) external {
+        revokedNonces[msg.sender][nonce] = true;
+        emit DelegationNonceRevoked(msg.sender, nonce);
+    }
+
+    /**
+     * @dev Recover and validate an EIP-712 `GuardianDelegation` signature.
+     *      Reverts with {DelegationInvalidOrExpired} when the grant is past
+     *      `validUntil`, the nonce has been revoked, or the signer is not `guardian`.
+     */
+    function verifyDelegation(
+        address guardian,
+        address delegate,
+        uint256 vaultId,
+        uint256 validUntil,
+        uint256 nonce,
+        bytes calldata signature
+    ) public view {
+        if (block.timestamp > validUntil || revokedNonces[guardian][nonce] || !isGuardian[vaultId][guardian]) {
+            revert DelegationInvalidOrExpired();
+        }
+
+        bytes32 digest = _hashTypedDataV4(
+            keccak256(
+                abi.encode(GUARDIAN_DELEGATION_TYPEHASH, guardian, delegate, vaultId, validUntil, nonce)
+            )
+        );
+        (address signer, ECDSA.RecoverError err, ) = ECDSA.tryRecover(digest, signature);
+        if (err != ECDSA.RecoverError.NoError || signer != guardian) {
+            revert DelegationInvalidOrExpired();
+        }
+    }
+
+    /**
+     * @dev Delegate submits an approval (and optional beneficiary share) on behalf
+     *      of `guardian` using a valid EIP-712 {GuardianDelegation} signature.
+     *      The approval is recorded against the guardian, not the delegate.
+     */
+    function approveAccessByDelegation(
+        uint256 requestId,
+        address guardian,
+        uint256 validUntil,
+        uint256 nonce,
+        bytes calldata signature,
+        string calldata encryptedShareForBeneficiary
+    ) external nonReentrant {
+        AccessRequest storage request = accessRequests[requestId];
+        if (request.requestId == 0) revert RequestNotExist();
+
+        verifyDelegation(
+            guardian,
+            msg.sender,
+            documents[request.documentId].vaultId,
+            validUntil,
+            nonce,
+            signature
+        );
+        _approveAccess(requestId, encryptedShareForBeneficiary, guardian);
+    }
+
+    function _approveAccess(
+        uint256 requestId,
+        string memory encryptedShareForBeneficiary,
+        address guardian
+    ) internal {
+        AccessRequest storage request = accessRequests[requestId];
+        if (request.requestId == 0) revert RequestNotExist();
+        if (request.status != RequestStatus.PENDING) revert RequestNotPending();
+        if (request.expiresAt <= block.timestamp) revert RequestExpired();
+        if (request.requester == guardian || request.requester == msg.sender) revert CannotSelfApproveAccess();
+
+        uint256 vaultId = documents[request.documentId].vaultId;
+        if (!isGuardian[vaultId][guardian]) revert OnlyGuardian();
+        if (hasApprovedRequest[requestId][guardian]) revert AlreadyApproved();
+
+        bytes memory guardianKey = bytes(userPublicKeys[guardian]);
+        if (guardianKey.length != 0 && _revokedKeyHashes[keccak256(guardianKey)]) {
+            revert RevokedPublicKey();
+        }
+
+        hasApprovedRequest[requestId][guardian] = true;
+        request.approvedBy.push(guardian);
+
+        if (bytes(encryptedShareForBeneficiary).length > 0) {
+            beneficiaryKeyShares[requestId][guardian] = encryptedShareForBeneficiary;
+            emit ShareSubmittedForBeneficiary(requestId, guardian, encryptedShareForBeneficiary);
+        }
+
+        emit AccessApproved(requestId, guardian);
+
+        if (request.approvedBy.length >= vaults[vaultId].approvalThreshold) {
+            if (!_ownsVaultToken(request.requester, vaultId)) {
+                request.status = RequestStatus.REJECTED;
+                return;
+            }
+
+            request.status = RequestStatus.APPROVED;
+            _grantAccess(requestId, request.documentId, request.requester);
+        }
     }
 
     /**
@@ -1552,45 +1671,6 @@ contract SpooVault is ERC721, ISpooVault, ReentrancyGuard, EIP712 {
                 request.requester,
                 fheRequestAccumulator[requestId]
             );
-        }
-    }
-
-    function _approveAccess(uint256 requestId, string memory encryptedShareForBeneficiary) internal {
-        AccessRequest storage request = accessRequests[requestId];
-        if (request.requestId == 0) revert RequestNotExist();
-        if (request.status != RequestStatus.PENDING) revert RequestNotPending();
-        if (request.expiresAt <= block.timestamp) revert RequestExpired();
-        if (request.requester == msg.sender) revert CannotSelfApproveAccess();
-
-        uint256 vaultId = documents[request.documentId].vaultId;
-        if (!isGuardian[vaultId][msg.sender]) revert OnlyGuardian();
-        if (hasApprovedRequest[requestId][msg.sender]) revert AlreadyApproved();
-
-        // A guardian whose registered key is blacklisted as compromised may not submit
-        // new key material until it has been rotated via revokeKey().
-        bytes memory guardianKey = bytes(userPublicKeys[msg.sender]);
-        if (guardianKey.length != 0 && _revokedKeyHashes[keccak256(guardianKey)]) {
-            revert RevokedPublicKey();
-        }
-
-        hasApprovedRequest[requestId][msg.sender] = true;
-        request.approvedBy.push(msg.sender);
-
-        if (bytes(encryptedShareForBeneficiary).length > 0) {
-            beneficiaryKeyShares[requestId][msg.sender] = encryptedShareForBeneficiary;
-            emit ShareSubmittedForBeneficiary(requestId, msg.sender, encryptedShareForBeneficiary);
-        }
-
-        emit AccessApproved(requestId, msg.sender);
-
-        if (request.approvedBy.length >= vaults[vaultId].approvalThreshold) {
-            if (!_ownsVaultToken(request.requester, vaultId)) {
-                request.status = RequestStatus.REJECTED;
-                return;
-            }
-
-            request.status = RequestStatus.APPROVED;
-            _grantAccess(requestId, request.documentId, request.requester);
         }
     }
 
