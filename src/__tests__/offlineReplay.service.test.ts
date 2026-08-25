@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
+import "fake-indexeddb/auto";
 
 vi.mock("../services/contract.service", () => ({
   contractService: {
@@ -51,7 +52,7 @@ const mockedRequestAccess = vi.mocked(contractService.requestAccess);
 
 describe("offline replay service", () => {
   beforeEach(() => {
-    __setOfflineDbFactoryForTests(new IDBFactory(), IDBKeyRange);
+    const factory = new IDBFactory(); globalThis.indexedDB = factory; __setOfflineDbFactoryForTests(factory);
     vi.stubGlobal("navigator", { onLine: true });
     vi.clearAllMocks();
     mockedAddDocument.mockResolvedValue(0);

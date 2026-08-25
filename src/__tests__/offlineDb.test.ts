@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
+import "fake-indexeddb/auto";
 import {
   __setOfflineDbFactoryForTests,
   countActionsByStatus,
@@ -33,7 +34,7 @@ const vaultInput = (id: number) => ({
 
 describe("offline db (Dexie/IndexedDB schema)", () => {
   beforeEach(() => {
-    __setOfflineDbFactoryForTests(new IDBFactory(), IDBKeyRange);
+    const factory = new IDBFactory(); globalThis.indexedDB = factory; __setOfflineDbFactoryForTests(factory);
   });
 
   afterEach(() => {

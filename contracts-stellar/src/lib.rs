@@ -1438,6 +1438,11 @@ impl SpooVaultStellar {
         record.release_state.last_proof_of_life = env.ledger().timestamp();
         record.release_state.last_proof_of_life_sequence = env.ledger().sequence();
         Self::save_vault_record(&env, vault_id, &record);
+        
+        env.events().publish(
+            (Symbol::new(&env, "prove_life"), vault_id),
+            (owner, env.ledger().timestamp()),
+        );
     }
 
     /// Authorize a Web3 Keeper (Chainlink Automation / Gelato) to relay proof-of-life
@@ -1677,6 +1682,11 @@ impl SpooVaultStellar {
 
         record.release_state.emergency_mode = enabled;
         Self::save_vault_record(&env, vault_id, &record);
+        
+        env.events().publish(
+            (Symbol::new(&env, "emergency_mode"), vault_id),
+            enabled,
+        );
     }
 
     /// Configure an optional external registry contract to be notified whenever
@@ -2426,8 +2436,6 @@ mod test;
 mod fuzz_test;
 
 
-#![no_std]
-use soroban_sdk::{contract, contractimpl, Address, Env, Bytes};
 
 #[contract]
 pub struct FheVaultContract;
@@ -2442,7 +2450,7 @@ impl FheVaultContract {
         let mut accumulator: Bytes = storage.get(&vault_id).unwrap_or_else(|| Bytes::from_array(&env, &[0u8; 32]));
 
         // Perform homomorphic addition over ciphertext bytes
-        accumulator = Self.homomorphic_add(&env, &accumulator, &encrypted_share);
+        accumulator = Self::homomorphic_add(&env, &accumulator, &encrypted_share);
 
         storage.set(&vault_id, &accumulator);
     }

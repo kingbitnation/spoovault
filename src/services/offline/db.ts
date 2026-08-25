@@ -1,4 +1,4 @@
-import Dexie, { type Table } from "dexie";
+import { openDB, type IDBPDatabase, type DBSchema } from "idb";
 
 export type OfflineNetwork = "avalanche" | "stellar";
 
@@ -72,33 +72,37 @@ export interface PendingActionRecord {
   network: OfflineNetwork;
 }
 
-interface VaultRow extends CachedVault {}
-interface DocumentRow extends CachedDocument {}
-
-class SpooVaultOfflineDB extends Dexie {
-  vaults!: Table<VaultRow, string>;
-  documents!: Table<DocumentRow, string>;
-  invites!: Table<CachedInvite, number>;
-  keyring!: Table<CachedPublicKey, string>;
-  actions!: Table<PendingActionRecord, number>;
-
-  constructor(options?: { indexedDB?: IDBFactory }) {
-    super("spoovault-offline", options);
-
-    this.version(1).stores({
-      vaults: "key, account, network, cachedAt, [account+network]",
-      documents: "key, account, network, vaultId, cachedAt, [account+network]",
-      invites: "++id, account, network, [account+network]",
-      keyring: "key, address, network",
-      actions: "++id, status, kind, createdAt",
-    });
-  }
+interface SpooVaultDBSchema extends DBSchema {
+  vaults: {
+    key: string;
+    value: CachedVault;
+    indexes: { "account+network": [string, OfflineNetwork] };
+  };
+  documents: {
+    key: string;
+    value: CachedDocument;
+    indexes: { "account+network": [string, OfflineNetwork] };
+  };
+  invites: {
+    key: number;
+    value: CachedInvite;
+    indexes: { "account+network": [string, OfflineNetwork] };
+  };
+  keyring: {
+    key: string;
+    value: CachedPublicKey;
+  };
+  actions: {
+    key: number;
+    value: PendingActionRecord;
+    indexes: { "status": PendingActionStatus };
+  };
 }
 
 const entityKey = (...parts: Array<string | number>): string =>
   parts.map((part) => String(part).toLowerCase()).join("::");
 
-let dexieInstance: SpooVaultOfflineDB | null = null;
+let dbInstancePromise: Promise<IDBPDatabase<SpooVaultDBSchema>> | null = null;
 let injectedFactory: IDBFactory | null = null;
 let injectedKeyRange: unknown = null;
 
@@ -116,46 +120,41 @@ const resolveFactory = (): IDBFactory | undefined => {
     : undefined;
 };
 
-const getDb = (): SpooVaultOfflineDB | null => {
+const getDb = async (): Promise<IDBPDatabase<SpooVaultDBSchema> | null> => {
   const factory = resolveFactory();
   if (!factory) return null;
 
-  if (!dexieInstance) {
-    try {
-      const keyRange =
-        injectedKeyRange ??
-        (typeof globalThis.IDBKeyRange !== "undefined"
-          ? globalThis.IDBKeyRange
-          : undefined);
-      dexieInstance = new SpooVaultOfflineDB({
-        indexedDB: factory,
-        IDBKeyRange: keyRange,
-      } as never);
-    } catch {
-      return null;
-    }
+  if (!dbInstancePromise) {
+    dbInstancePromise = openDB<SpooVaultDBSchema>("spoovault-offline", 1, {
+      upgrade(db) {
+        const vaultsStore = db.createObjectStore("vaults", { keyPath: "key" });
+        vaultsStore.createIndex("account+network", ["account", "network"]);
+
+        const docsStore = db.createObjectStore("documents", { keyPath: "key" });
+        docsStore.createIndex("account+network", ["account", "network"]);
+
+        const invitesStore = db.createObjectStore("invites", { keyPath: "id", autoIncrement: true });
+        invitesStore.createIndex("account+network", ["account", "network"]);
+
+        db.createObjectStore("keyring", { keyPath: "key" });
+
+        const actionsStore = db.createObjectStore("actions", { keyPath: "id", autoIncrement: true });
+        actionsStore.createIndex("status", "status");
+      },
+    }).catch(() => {
+      dbInstancePromise = null;
+      return null as any;
+    });
   }
-  return dexieInstance;
+  return dbInstancePromise;
 };
 
-/**
- * Test-only hook: swap the IndexedDB factory backing the offline database.
- * Passing null forces the in-memory fallback used by non-browser environments.
- */
 export const __setOfflineDbFactoryForTests = (
   factory: IDBFactory | null,
   idbKeyRange?: unknown
 ): void => {
-  if (dexieInstance) {
-    try {
-      dexieInstance.close();
-    } catch {
-      // ignore close errors on stale connections
-    }
-  }
-  dexieInstance = null;
+  dbInstancePromise = null;
   injectedFactory = factory;
-  injectedKeyRange = idbKeyRange ?? null;
   memoryVaults.clear();
   memoryDocuments.clear();
   memoryInvites.length = 0;
@@ -165,10 +164,6 @@ export const __setOfflineDbFactoryForTests = (
 };
 
 const now = (): number => Date.now();
-
-// ---------------------------------------------------------------------------
-// Vaults
-// ---------------------------------------------------------------------------
 
 export const putVaults = async (
   account: string,
@@ -186,12 +181,14 @@ export const putVaults = async (
     cachedAt: now(),
   }));
 
-  const db = getDb();
+  const db = await getDb();
   if (!db) {
     rows.forEach((row) => memoryVaults.set(row.key, row));
     return;
   }
-  await db.vaults.bulkPut(rows);
+  const tx = db.transaction("vaults", "readwrite");
+  await Promise.all(rows.map((row) => tx.store.put(row)));
+  await tx.done;
 };
 
 export const getCachedVaults = async (
@@ -201,24 +198,15 @@ export const getCachedVaults = async (
   if (!account) return [];
   const normalizedAccount = account.toLowerCase();
 
-  const db = getDb();
+  const db = await getDb();
   if (!db) {
     return [...memoryVaults.values()]
-      .filter(
-        (row) => row.account === normalizedAccount && row.network === network
-      )
+      .filter((row) => row.account === normalizedAccount && row.network === network)
       .sort((a, b) => a.id - b.id);
   }
-  return db.vaults
-    .where("[account+network]")
-    .equals([normalizedAccount, network])
-    .toArray()
-    .then((rows) => rows.sort((a, b) => a.id - b.id));
+  const rows = await db.getAllFromIndex("vaults", "account+network", [normalizedAccount, network]);
+  return rows.sort((a, b) => a.id - b.id);
 };
-
-// ---------------------------------------------------------------------------
-// Documents
-// ---------------------------------------------------------------------------
 
 export const putDocuments = async (
   account: string,
@@ -235,12 +223,14 @@ export const putDocuments = async (
     cachedAt: now(),
   }));
 
-  const db = getDb();
+  const db = await getDb();
   if (!db) {
     rows.forEach((row) => memoryDocuments.set(row.key, row));
     return;
   }
-  await db.documents.bulkPut(rows);
+  const tx = db.transaction("documents", "readwrite");
+  await Promise.all(rows.map((row) => tx.store.put(row)));
+  await tx.done;
 };
 
 export const getCachedDocuments = async (
@@ -250,24 +240,15 @@ export const getCachedDocuments = async (
   if (!account) return [];
   const normalizedAccount = account.toLowerCase();
 
-  const db = getDb();
+  const db = await getDb();
   if (!db) {
     return [...memoryDocuments.values()]
-      .filter(
-        (row) => row.account === normalizedAccount && row.network === network
-      )
+      .filter((row) => row.account === normalizedAccount && row.network === network)
       .sort((a, b) => a.id - b.id);
   }
-  return db.documents
-    .where("[account+network]")
-    .equals([normalizedAccount, network])
-    .toArray()
-    .then((rows) => rows.sort((a, b) => a.id - b.id));
+  const rows = await db.getAllFromIndex("documents", "account+network", [normalizedAccount, network]);
+  return rows.sort((a, b) => a.id - b.id);
 };
-
-// ---------------------------------------------------------------------------
-// Guardian invites
-// ---------------------------------------------------------------------------
 
 export const putInvites = async (
   account: string,
@@ -283,21 +264,18 @@ export const putInvites = async (
     cachedAt: now(),
   }));
 
-  const db = getDb();
+  const db = await getDb();
   if (!db) {
     memoryInvites.length = 0;
-    stamped.forEach((invite) => memoryInvites.push(invite));
+    stamped.forEach((invite) => memoryInvites.push(invite as CachedInvite));
     return;
   }
 
-  await db.transaction("rw", db.invites, async () => {
-    const existing = await db.invites
-      .where("[account+network]")
-      .equals([normalizedAccount, network])
-      .toArray();
-    await db.invites.bulkDelete(existing.map((row) => row.id!).filter(Boolean));
-    await db.invites.bulkAdd(stamped);
-  });
+  const tx = db.transaction("invites", "readwrite");
+  const existing = await tx.store.index("account+network").getAll([normalizedAccount, network]);
+  await Promise.all(existing.map((row) => row.id && tx.store.delete(row.id)));
+  await Promise.all(stamped.map((invite) => tx.store.add(invite as CachedInvite)));
+  await tx.done;
 };
 
 export const getCachedInvites = async (
@@ -307,21 +285,14 @@ export const getCachedInvites = async (
   if (!account) return [];
   const normalizedAccount = account.toLowerCase();
 
-  const db = getDb();
+  const db = await getDb();
   if (!db) {
     return memoryInvites.filter(
       (row) => row.account === normalizedAccount && row.network === network
     );
   }
-  return db.invites
-    .where("[account+network]")
-    .equals([normalizedAccount, network])
-    .toArray();
+  return db.getAllFromIndex("invites", "account+network", [normalizedAccount, network]);
 };
-
-// ---------------------------------------------------------------------------
-// Public key ring (address -> registered on-chain public key)
-// ---------------------------------------------------------------------------
 
 export const putPublicKey = async (
   address: string,
@@ -338,12 +309,12 @@ export const putPublicKey = async (
     cachedAt: now(),
   };
 
-  const db = getDb();
+  const db = await getDb();
   if (!db) {
     memoryKeyring.set(row.key, row);
     return;
   }
-  await db.keyring.put(row);
+  await db.put("keyring", row);
 };
 
 export const getCachedPublicKey = async (
@@ -353,22 +324,18 @@ export const getCachedPublicKey = async (
   if (!address) return null;
   const key = entityKey(address.toLowerCase(), network);
 
-  const db = getDb();
+  const db = await getDb();
   if (!db) {
     return memoryKeyring.get(key)?.publicKey ?? null;
   }
-  const row = await db.keyring.get(key);
+  const row = await db.get("keyring", key);
   return row ? row.publicKey : null;
 };
-
-// ---------------------------------------------------------------------------
-// Pending action queue
-// ---------------------------------------------------------------------------
 
 export const insertAction = async (
   record: Omit<PendingActionRecord, "id">
 ): Promise<PendingActionRecord> => {
-  const db = getDb();
+  const db = await getDb();
   if (!db) {
     const withId: PendingActionRecord = {
       ...record,
@@ -377,21 +344,21 @@ export const insertAction = async (
     memoryActions.push(withId);
     return withId;
   }
-  const id = await db.actions.add(record as PendingActionRecord);
+  const id = await db.add("actions", record as PendingActionRecord);
   return { ...record, id };
 };
 
 export const listActionsByStatus = async (
   statuses: PendingActionStatus[]
 ): Promise<PendingActionRecord[]> => {
-  const db = getDb();
+  const db = await getDb();
   if (!db) {
     return memoryActions
       .filter((row) => statuses.includes(row.status))
       .sort((a, b) => a.createdAt - b.createdAt || (a.id ?? 0) - (b.id ?? 0));
   }
 
-  const rows = await db.actions.toArray();
+  const rows = await db.getAll("actions");
   return rows
     .filter((row) => statuses.includes(row.status))
     .sort((a, b) => a.createdAt - b.createdAt || (a.id ?? 0) - (b.id ?? 0));
@@ -401,7 +368,7 @@ export const updateAction = async (
   id: number,
   changes: Partial<Omit<PendingActionRecord, "id">>
 ): Promise<void> => {
-  const db = getDb();
+  const db = await getDb();
   if (!db) {
     const index = memoryActions.findIndex((row) => row.id === id);
     if (index >= 0) {
@@ -409,13 +376,16 @@ export const updateAction = async (
     }
     return;
   }
-  await db.actions.update(id, changes);
+  const existing = await db.get("actions", id);
+  if (existing) {
+    await db.put("actions", { ...existing, ...changes });
+  }
 };
 
 export const deleteActionsByStatus = async (
   statuses: PendingActionStatus[]
 ): Promise<void> => {
-  const db = getDb();
+  const db = await getDb();
   if (!db) {
     for (let i = memoryActions.length - 1; i >= 0; i -= 1) {
       if (statuses.includes(memoryActions[i].status)) {
@@ -425,18 +395,21 @@ export const deleteActionsByStatus = async (
     return;
   }
 
-  const rows = await db.actions.toArray();
+  const rows = await db.getAll("actions");
+  const tx = db.transaction("actions", "readwrite");
   const ids = rows
     .filter((row) => statuses.includes(row.status))
     .map((row) => row.id!)
     .filter(Boolean);
-  await db.actions.bulkDelete(ids);
+  
+  await Promise.all(ids.map(id => tx.store.delete(id)));
+  await tx.done;
 };
 
 export const countActionsByStatus = async (): Promise<
   Record<PendingActionStatus, number>
 > => {
-  const db = getDb();
+  const db = await getDb();
   const empty = { pending: 0, processing: 0, synced: 0, failed: 0 };
 
   if (!db) {
@@ -446,7 +419,7 @@ export const countActionsByStatus = async (): Promise<
     }, empty);
   }
 
-  const rows = await db.actions.toArray();
+  const rows = await db.getAll("actions");
   return rows.reduce((acc, row) => {
     acc[row.status] += 1;
     return acc;
