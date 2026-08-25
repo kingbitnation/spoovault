@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
+import "fake-indexeddb/auto";
 import {
   OfflineQueuedError,
   isNetworkFailure,
@@ -50,7 +51,7 @@ describe("isNetworkFailure", () => {
 
 describe("withOfflineFallback", () => {
   beforeEach(() => {
-    __setOfflineDbFactoryForTests(new IDBFactory(), IDBKeyRange);
+    const factory = new IDBFactory(); globalThis.indexedDB = factory; __setOfflineDbFactoryForTests(factory);
   });
 
   afterEach(() => {

@@ -1,4 +1,3 @@
-import { Workbox } from "workbox-window";
 import {
   MSG_REPLAY_QUEUE,
   MSG_SYNC_STATUS,
@@ -46,7 +45,7 @@ const announceReplayOutcome = (): void => {
 
 /**
  * Wire the offline-first layer into the page:
- *  - register the Workbox service worker (production builds)
+ *  - register the native service worker (production builds)
  *  - drain the queued actions when connectivity returns (`online` event or
  *    the service worker's background sync broadcast)
  *  - keep queue state fresh for the UI banner
@@ -73,9 +72,12 @@ export const initOfflineLayer = (): void => {
     try {
       // The SW bundle shares ESM chunks with the app, so it must be
       // registered as a module worker.
-      const wb = new Workbox("/sw.js", { type: "module" });
+      navigator.serviceWorker.register("/sw.js", { type: "module" }).catch(() => {
+        // SW registration is a progressive enhancement (e.g. unsupported in
+        // insecure contexts); the `online` event path still works without it.
+      });
 
-      wb.addEventListener("message", (event) => {
+      navigator.serviceWorker.addEventListener("message", (event) => {
         const data = event.data as { type?: string; supported?: boolean } | undefined;
         if (data?.type === MSG_REPLAY_QUEUE) {
           announceReplayOutcome();
@@ -84,11 +86,6 @@ export const initOfflineLayer = (): void => {
         if (data?.type === MSG_SYNC_STATUS) {
           void refreshQueueState();
         }
-      });
-
-      void wb.register().catch(() => {
-        // SW registration is a progressive enhancement (e.g. unsupported in
-        // insecure contexts); the `online` event path still works without it.
       });
     } catch {
       // never let SW setup break app boot

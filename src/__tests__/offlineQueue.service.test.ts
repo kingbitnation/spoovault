@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
+import "fake-indexeddb/auto";
 import {
   __setOfflineDbFactoryForTests,
   countActionsByStatus,
@@ -17,7 +18,7 @@ import { SYNC_TAG } from "../services/offline/syncConstants";
 
 describe("offline queue", () => {
   beforeEach(() => {
-    __setOfflineDbFactoryForTests(new IDBFactory(), IDBKeyRange);
+    const factory = new IDBFactory(); globalThis.indexedDB = factory; __setOfflineDbFactoryForTests(factory);
     vi.stubGlobal("navigator", { onLine: true });
   });
 

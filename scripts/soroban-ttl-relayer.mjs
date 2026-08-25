@@ -270,6 +270,17 @@ export async function submitTtlExtensionTx(
   args,
   networkPassphrase
 ) {
+  return submitBatchTtlExtensionTx(server, keypair, contractId, functionName, [args], networkPassphrase);
+}
+
+export async function submitBatchTtlExtensionTx(
+  server,
+  keypair,
+  contractId,
+  functionName,
+  argsList,
+  networkPassphrase
+) {
   if (!_sdk) throw new Error("SDK not loaded yet");
   const {
     Account,
@@ -281,44 +292,37 @@ export async function submitTtlExtensionTx(
 
   const passphrase = networkPassphrase || Networks.TESTNET;
 
-  // 1. Fetch current sequence number for the relayer account
   const sourceAccount = await server.getAccount(keypair.publicKey());
 
-  // 2. Build the invoke-contract operation
-  const op = Operation.invokeContractFunction({
-    contract: contractId,
-    function: functionName,
-    args,
-  });
-
-  // 3. Build a preliminary transaction (fee will be updated after simulation)
-  const tx = new TransactionBuilder(sourceAccount, {
+  let builder = new TransactionBuilder(sourceAccount, {
     fee: "100",
     networkPassphrase: passphrase,
-  })
-    .addOperation(op)
-    .setTimeout(60)
-    .build();
+  });
 
-  // 4. Simulate to get the actual resource fee and footprint
+  for (const args of argsList) {
+    builder.addOperation(Operation.invokeContractFunction({
+      contract: contractId,
+      function: functionName,
+      args,
+    }));
+  }
+
+  const tx = builder.setTimeout(60).build();
+
   const simulation = await server.simulateTransaction(tx);
   if (_sdk.rpc.Api.isSimulationError(simulation)) {
     throw new Error(
-      `Simulation failed for ${functionName}: ${simulation.error}`
+      `Simulation failed for batch ${functionName}: ${simulation.error}`
     );
   }
 
-  // 5. Assemble the transaction with correct fee + soroban data
   const preparedTx = _sdk.rpc.assembleTransaction(tx, simulation).build();
-
-  // 6. Sign with the relayer key
   preparedTx.sign(keypair);
 
-  // 7. Submit
   const response = await server.sendTransaction(preparedTx);
   if (response.status === "ERROR") {
     throw new Error(
-      `sendTransaction failed for ${functionName}: ${JSON.stringify(
+      `sendTransaction failed for batch ${functionName}: ${JSON.stringify(
         response.errorResult
       )}`
     );
@@ -326,7 +330,6 @@ export async function submitTtlExtensionTx(
 
   const txHash = response.hash;
 
-  // 8. Poll for confirmation (up to 30 attempts × 2 s)
   for (let attempt = 0; attempt < 30; attempt++) {
     const status = await server.getTransaction(txHash);
     if (status.status === "SUCCESS") return txHash;
@@ -421,6 +424,8 @@ export async function scanAndBumpEntityType({
   let scanned = 0;
   let bumped = 0;
   let errors = 0;
+  
+  const idsToBump = [];
 
   for (let id = 1; id <= limit; id++) {
     scanned++;
@@ -452,31 +457,38 @@ export async function scanAndBumpEntityType({
 
     if (remaining < ttlThreshold) {
       info(
-        `TTL below threshold for ${dataKeyTag}#${id} – remaining=${remaining} ledgers. Bumping…`,
+        `TTL below threshold for ${dataKeyTag}#${id} – remaining=${remaining} ledgers. Queuing for bump…`,
         { id, remaining, threshold: ttlThreshold }
       );
+      idsToBump.push(id);
+    }
+  }
 
-      try {
-        const txHash = await withRetry(
-          () =>
-            submitTtlExtensionTx(
-              server,
-              keypair,
-              contractId,
-              extendFn,
-              [scValU64(id)],
-              networkPassphrase
-            ),
-          maxRetries,
-          retryDelayMs,
-          `${extendFn}(${id})`
-        );
-        info(`Bumped ${dataKeyTag}#${id} – tx=${txHash}`);
-        bumped++;
-      } catch (err) {
-        error(`Failed to bump ${dataKeyTag}#${id}: ${err.message}`);
-        errors++;
-      }
+  // Batch process bumps in groups of 50
+  const BATCH_SIZE = 50;
+  for (let i = 0; i < idsToBump.length; i += BATCH_SIZE) {
+    const batch = idsToBump.slice(i, i + BATCH_SIZE);
+    const argsList = batch.map(id => [scValU64(id)]);
+    try {
+      const txHash = await withRetry(
+        () =>
+          submitBatchTtlExtensionTx(
+            server,
+            keypair,
+            contractId,
+            extendFn,
+            argsList,
+            networkPassphrase
+          ),
+        maxRetries,
+        retryDelayMs,
+        `${extendFn}(batch of ${batch.length})`
+      );
+      info(`Bumped ${batch.length} ${dataKeyTag} entries – tx=${txHash}`);
+      bumped += batch.length;
+    } catch (err) {
+      error(`Failed to bump batch of ${dataKeyTag} entries: ${err.message}`);
+      errors += batch.length;
     }
   }
 

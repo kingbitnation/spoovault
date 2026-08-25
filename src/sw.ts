@@ -1,7 +1,3 @@
-import { clientsClaim } from "workbox-core";
-import { ExpirationPlugin } from "workbox-expiration";
-import { registerRoute } from "workbox-routing";
-import { CacheFirst, NetworkFirst, StaleWhileRevalidate } from "workbox-strategies";
 import {
   createSyncEventHandler,
   handleClientMessage,
@@ -18,6 +14,11 @@ interface SyncEventLike extends ExtendableEventLike {
 interface MessageEventLike extends ExtendableEventLike {
   data?: unknown;
   source: ClientMessageSource | null;
+}
+
+interface FetchEventLike extends ExtendableEventLike {
+  request: Request;
+  respondWith(response: Promise<Response> | Response): void;
 }
 
 interface ClientMessageSource {
@@ -40,6 +41,7 @@ interface ServiceWorkerScopeLike {
   addEventListener(type: "activate", listener: (event: ExtendableEventLike) => void): void;
   addEventListener(type: "sync", listener: (event: SyncEventLike) => void): void;
   addEventListener(type: "message", listener: (event: MessageEventLike) => void): void;
+  addEventListener(type: "fetch", listener: (event: FetchEventLike) => void): void;
 }
 
 const swSelf = self as unknown as ServiceWorkerScopeLike;
@@ -74,70 +76,86 @@ swSelf.addEventListener("activate", (event) => {
   );
 });
 
-// SPA navigations: try the network first so users get fresh builds, fall back
-// to the cached shell when offline.
-registerRoute(
-  ({ request }) => request.mode === "navigate",
-  new NetworkFirst({
-    cacheName: SHELL_CACHE,
-    plugins: [
-      new ExpirationPlugin({ maxEntries: 8, maxAgeSeconds: 7 * 24 * 60 * 60 }),
-    ],
-  })
-);
+async function networkFirst(request: Request, cacheName: string): Promise<Response> {
+  try {
+    const networkResponse = await fetch(request);
+    if (networkResponse.ok) {
+      const cache = await caches.open(cacheName);
+      cache.put(request, networkResponse.clone());
+    }
+    return networkResponse;
+  } catch (error) {
+    const cachedResponse = await caches.match(request);
+    if (cachedResponse) {
+      return cachedResponse;
+    }
+    throw error;
+  }
+}
 
-// Hashed static assets: serve from cache instantly, refresh in background.
-registerRoute(
-  ({ url, request }) =>
+async function staleWhileRevalidate(request: Request, cacheName: string): Promise<Response> {
+  const cache = await caches.open(cacheName);
+  const cachedResponse = await cache.match(request);
+  const fetchPromise = fetch(request).then((networkResponse) => {
+    if (networkResponse.ok) {
+      cache.put(request, networkResponse.clone());
+    }
+    return networkResponse;
+  }).catch(() => {
+    return new Response('', { status: 504, statusText: 'Gateway Timeout' });
+  });
+  return cachedResponse || fetchPromise;
+}
+
+async function cacheFirst(request: Request, cacheName: string): Promise<Response> {
+  const cachedResponse = await caches.match(request);
+  if (cachedResponse) {
+    return cachedResponse;
+  }
+  try {
+    const networkResponse = await fetch(request);
+    if (networkResponse.ok) {
+      const cache = await caches.open(cacheName);
+      cache.put(request, networkResponse.clone());
+    }
+    return networkResponse;
+  } catch (error) {
+    throw error;
+  }
+}
+
+swSelf.addEventListener("fetch", (event) => {
+  const url = new URL(event.request.url);
+
+  if (event.request.mode === "navigate") {
+    event.respondWith(networkFirst(event.request, SHELL_CACHE));
+    return;
+  }
+
+  if (
     url.origin === swSelf.location.origin &&
-    ["script", "style", "image", "font", "worker"].includes(request.destination),
-  new StaleWhileRevalidate({
-    cacheName: ASSET_CACHE,
-    plugins: [
-      new ExpirationPlugin({
-        maxEntries: 120,
-        maxAgeSeconds: 30 * 24 * 60 * 60,
-        purgeOnQuotaError: true,
-      }),
-    ],
-  })
-);
+    ["script", "style", "image", "font", "worker"].includes(event.request.destination)
+  ) {
+    event.respondWith(staleWhileRevalidate(event.request, ASSET_CACHE));
+    return;
+  }
 
-// IPFS gateway content is immutable — cache aggressively for offline document
-// metadata inspection.
-registerRoute(
-  ({ url }) =>
-    /pinata\.cloud$/.test(url.hostname) && url.pathname.includes("/ipfs/"),
-  new CacheFirst({
-    cacheName: IPFS_CACHE,
-    plugins: [
-      new ExpirationPlugin({
-        maxEntries: 200,
-        maxAgeSeconds: 30 * 24 * 60 * 60,
-        purgeOnQuotaError: true,
-      }),
-    ],
-  })
-);
+  if (/pinata\.cloud$/.test(url.hostname) && url.pathname.includes("/ipfs/")) {
+    event.respondWith(cacheFirst(event.request, IPFS_CACHE));
+    return;
+  }
+});
 
-// Background sync: the browser fires this when connectivity returns after
-// actions were queued with our tag. Wake every open window so the Dexie-backed
-// queue can be replayed through contractService (wallet-signed transactions
-// must be executed in the page context).
 swSelf.addEventListener(
   "sync",
   createSyncEventHandler(swSelf.clients, {
     onReplayBroadcast: (clientCount) => {
       if (clientCount === 0) {
-        // No window was open; nothing to wake. The next app launch drains the
-        // queue on startup via initOfflineLayer().
       }
     },
   })
 );
 
-// Clients ask the worker to register the sync tag right after queueing an
-// action while offline, keeping the registration alive even if the page closes.
 swSelf.addEventListener("message", (event) => {
   const source = event.source;
   event.waitUntil(
@@ -146,5 +164,3 @@ swSelf.addEventListener("message", (event) => {
     })
   );
 });
-
-clientsClaim();
