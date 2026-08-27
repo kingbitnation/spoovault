@@ -450,6 +450,14 @@ export const createStorageProviderService = (
         opts.plaintext instanceof Blob
           ? opts.plaintext
           : new Blob([opts.plaintext as BlobPart]);
+      // Backup providers (Filecoin/Arweave) require Blob — buffering is unavoidable.
+      // Warn for large files since this runs in the background after the primary streaming upload.
+      if (source.size > 500 * 1024 * 1024) {
+        console.warn(
+          `[storageProvider] Backup replication buffering ${(source.size / 1024 / 1024).toFixed(0)}MB ciphertext in memory. ` +
+          `Primary upload streamed efficiently; this runs in the background.`
+        );
+      }
       const encryptedStream = await encryptFileStream(source, opts.keyHex);
       return { bytes: await collectStream(encryptedStream) };
     }

@@ -235,17 +235,118 @@ describe("SpooVault EVM Contract Unit Tests", function () {
       expect(state.postDeathUnlocked).to.equal(false);
     });
 
-    it("should unlock post-death release once both the timestamp threshold and minimum block delta have elapsed", async function () {
+    it("should unlock post-death release once both the timestamp threshold and targetBlocks have elapsed", async function () {
       const guardians = [guardian1.address];
       await spooVault.connect(owner).createVault("Inheritance Vault", "Desc", guardians, 1);
       await spooVault.connect(owner).configureVaultRelease(1, 1 * 24 * 60 * 60); // 1 day
 
       await time.increase(2 * 24 * 60 * 60);
-      const minBlockDelta = await spooVault.MIN_POST_DEATH_BLOCK_DELTA();
-      await mine(minBlockDelta);
+      const targetBlocks = await spooVault.getTargetBlocks(1);
+      await mine(targetBlocks);
 
       const state = await spooVault.getVaultReleaseState(1);
       expect(state.postDeathUnlocked).to.equal(true);
+    });
+
+    it("should compute targetBlocks dynamically from inactivity period and median block interval", async function () {
+      const guardians = [guardian1.address];
+      await spooVault.connect(owner).createVault("Inheritance Vault", "Desc", guardians, 1);
+      await spooVault.connect(owner).configureVaultRelease(1, 30 * 24 * 60 * 60); // 30 days
+
+      const targetBlocks = await spooVault.getTargetBlocks(1);
+      // With the default 12s block interval, 30 days = 2592000s / 12 = 216000 blocks
+      expect(targetBlocks).to.be.gte(200000n);
+      expect(targetBlocks).to.be.lte(300000n);
+    });
+
+    it("should NOT unlock post-death release when timestamp is spoofed but targetBlocks not reached", async function () {
+      const guardians = [guardian1.address];
+      await spooVault.connect(owner).createVault("Inheritance Vault", "Desc", guardians, 1);
+      await spooVault.connect(owner).configureVaultRelease(1, 30 * 24 * 60 * 60); // 30 days
+
+      const targetBlocks = await spooVault.getTargetBlocks(1);
+
+      // Simulate timestamp manipulation: advance timestamp far into the future
+      // but only mine a fraction of the required blocks.
+      await time.increase(60 * 24 * 60 * 60); // 60 days in the future
+      await mine(Math.floor(Number(targetBlocks) / 2)); // Only half the required blocks
+
+      const state = await spooVault.getVaultReleaseState(1);
+      expect(state.postDeathUnlocked).to.equal(false);
+    });
+
+    it("should NOT unlock post-death release when blocks are mined but timestamp not reached", async function () {
+      const guardians = [guardian1.address];
+      await spooVault.connect(owner).createVault("Inheritance Vault", "Desc", guardians, 1);
+      await spooVault.connect(owner).configureVaultRelease(1, 30 * 24 * 60 * 60); // 30 days
+
+      const targetBlocks = await spooVault.getTargetBlocks(1);
+
+      // Mine enough blocks but don't advance timestamp enough
+      await mine(Math.floor(Number(targetBlocks) * 1.5));
+      await time.increase(15 * 24 * 60 * 60); // Only 15 days
+
+      const state = await spooVault.getVaultReleaseState(1);
+      expect(state.postDeathUnlocked).to.equal(false);
+    });
+
+    it("should unlock post-death release only when BOTH timestamp and targetBlocks are satisfied", async function () {
+      const guardians = [guardian1.address];
+      await spooVault.connect(owner).createVault("Inheritance Vault", "Desc", guardians, 1);
+      await spooVault.connect(owner).configureVaultRelease(1, 30 * 24 * 60 * 60); // 30 days
+
+      const targetBlocks = await spooVault.getTargetBlocks(1);
+
+      // Advance both timestamp and blocks sufficiently
+      await time.increase(31 * 24 * 60 * 60); // 31 days
+      await mine(Math.floor(Number(targetBlocks) * 1.2)); // 120% of required blocks
+
+      const state = await spooVault.getVaultReleaseState(1);
+      expect(state.postDeathUnlocked).to.equal(true);
+    });
+
+    it("should resist single-block timestamp spoofing via median block interval", async function () {
+      const guardians = [guardian1.address];
+      await spooVault.connect(owner).createVault("Inheritance Vault", "Desc", guardians, 1);
+
+      // Record multiple proof-of-life heartbeats to populate the ring buffer
+      for (let i = 0; i < 10; i++) {
+        await spooVault.connect(owner).proveLife(1);
+        await mine(1);
+      }
+
+      const medianInterval = await spooVault.getMedianBlockInterval();
+      // Median interval should be reasonable (between 1 and 30 seconds)
+      expect(medianInterval).to.be.gte(1n);
+      expect(medianInterval).to.be.lte(30n);
+    });
+
+    it("should use default block interval when ring buffer has insufficient samples", async function () {
+      const guardians = [guardian1.address];
+      await spooVault.connect(owner).createVault("Inheritance Vault", "Desc", guardians, 1);
+
+      // No proof-of-life recorded yet, ring buffer is empty
+      const medianInterval = await spooVault.getMedianBlockInterval();
+      expect(medianInterval).to.equal(12n); // Default 12 seconds
+    });
+
+    it("should scale targetBlocks proportionally with inactivity period", async function () {
+      const guardians = [guardian1.address];
+      await spooVault.connect(owner).createVault("Inheritance Vault", "Desc", guardians, 1);
+
+      // Configure with 1 day inactivity period
+      await spooVault.connect(owner).configureVaultRelease(1, 1 * 24 * 60 * 60);
+      const targetBlocks1Day = await spooVault.getTargetBlocks(1);
+
+      // Create another vault and configure with 30 days
+      await spooVault.connect(owner).createVault("Vault 2", "Desc", guardians, 1);
+      await spooVault.connect(owner).configureVaultRelease(2, 30 * 24 * 60 * 60);
+      const targetBlocks30Days = await spooVault.getTargetBlocks(2);
+
+      // 30 days should require ~30x more blocks than 1 day
+      const ratio = Number(targetBlocks30Days) / Number(targetBlocks1Day);
+      expect(ratio).to.be.gte(25);
+      expect(ratio).to.be.lte(35);
     });
   });
 });

@@ -1990,4 +1990,197 @@ mod fhe_aggregation {
         assert_eq!(req.status, RequestStatus::Approved);
         assert!(client.has_access(&doc_id, &beneficiary));
     }
+
+    // -------------------------------------------------------------------------
+    // Issue #98: Ed25519 Threshold Signature Tests
+    // -------------------------------------------------------------------------
+
+    fn build_ed25519_threshold_batch(
+        env: &Env,
+        seeds: &[u8],
+        message: &[u8],
+        nonce: u64,
+        expiration_ledger: u32,
+    ) -> (Vec<BytesN<64>>, Vec<BytesN<32>>) {
+        use ed25519_dalek::{Signer as _, SigningKey};
+        use crate::threshold_sig::THRESHOLD_PREFIX;
+
+        let mut payload = std::vec::Vec::new();
+        payload.extend_from_slice(THRESHOLD_PREFIX);
+        payload.extend_from_slice(&nonce.to_be_bytes());
+        payload.extend_from_slice(&expiration_ledger.to_be_bytes());
+        payload.extend_from_slice(message);
+
+        let mut sigs = Vec::new(env);
+        let mut pks = Vec::new(env);
+
+        for &seed in seeds {
+            let sk = SigningKey::from_bytes(&[seed; 32]);
+            let pk_bytes: [u8; 32] = sk.verifying_key().to_bytes();
+            let sig_bytes: [u8; 64] = sk.sign(&payload).to_bytes();
+
+            sigs.push_back(BytesN::from_array(env, &sig_bytes));
+            pks.push_back(BytesN::from_array(env, &pk_bytes));
+        }
+
+        (sigs, pks)
+    }
+
+    #[test]
+    fn test_threshold_signature_verification_success_varying_k_of_n() {
+        let env = Env::default();
+        env.ledger().set_sequence_number(100);
+        let contract_id = env.register_contract(None, SpooVaultStellar);
+        let client = SpooVaultStellarClient::new(&env, &contract_id);
+
+        let message_bytes = b"ApproveReleaseDocument#42";
+        let message = Bytes::from_slice(&env, message_bytes);
+        let expiration_ledger = 500u32;
+
+        // Test 1-of-1
+        let (sigs1, pks1) = build_ed25519_threshold_batch(&env, &[1], message_bytes, 1, expiration_ledger);
+        assert!(client.verify_threshold_signatures(&message, &sigs1, &pks1, &1, &1, &expiration_ledger));
+
+        // Test 2-of-3
+        let (sigs2, pks2) = build_ed25519_threshold_batch(&env, &[2, 3, 4], message_bytes, 2, expiration_ledger);
+        assert!(client.verify_threshold_signatures(&message, &sigs2, &pks2, &2, &2, &expiration_ledger));
+
+        // Test 3-of-5
+        let (sigs3, pks3) = build_ed25519_threshold_batch(&env, &[10, 11, 12, 13, 14], message_bytes, 3, expiration_ledger);
+        assert!(client.verify_threshold_signatures(&message, &sigs3, &pks3, &3, &3, &expiration_ledger));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_threshold_signature_expired_reverts() {
+        let env = Env::default();
+        env.ledger().set_sequence_number(600); // Current sequence > expiration
+        let contract_id = env.register_contract(None, SpooVaultStellar);
+        let client = SpooVaultStellarClient::new(&env, &contract_id);
+
+        let message_bytes = b"ExpiredRelease";
+        let message = Bytes::from_slice(&env, message_bytes);
+        let expiration_ledger = 500u32; // Expired
+
+        let (sigs, pks) = build_ed25519_threshold_batch(&env, &[1, 2], message_bytes, 10, expiration_ledger);
+        client.verify_threshold_signatures(&message, &sigs, &pks, &2, &10, &expiration_ledger);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_threshold_signature_reused_nonce_reverts() {
+        let env = Env::default();
+        env.ledger().set_sequence_number(100);
+        let contract_id = env.register_contract(None, SpooVaultStellar);
+        let client = SpooVaultStellarClient::new(&env, &contract_id);
+
+        let message_bytes = b"ReplayProtectionCheck";
+        let message = Bytes::from_slice(&env, message_bytes);
+        let expiration_ledger = 500u32;
+        let nonce = 888u64;
+
+        let (sigs, pks) = build_ed25519_threshold_batch(&env, &[1, 2], message_bytes, nonce, expiration_ledger);
+        // First call succeeds
+        assert!(client.verify_threshold_signatures(&message, &sigs, &pks, &2, &nonce, &expiration_ledger));
+        // Second call with same nonce must revert
+        client.verify_threshold_signatures(&message, &sigs, &pks, &2, &nonce, &expiration_ledger);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_threshold_signature_duplicate_signer_reverts() {
+        let env = Env::default();
+        env.ledger().set_sequence_number(100);
+        let contract_id = env.register_contract(None, SpooVaultStellar);
+        let client = SpooVaultStellarClient::new(&env, &contract_id);
+
+        let message_bytes = b"DuplicateSignerCheck";
+        let message = Bytes::from_slice(&env, message_bytes);
+        let expiration_ledger = 500u32;
+        let nonce = 999u64;
+
+        // Build single signature and duplicate it to satisfy threshold of 2
+        let (sigs, pks) = build_ed25519_threshold_batch(&env, &[5], message_bytes, nonce, expiration_ledger);
+        let mut dup_sigs = Vec::new(&env);
+        dup_sigs.push_back(sigs.get(0).unwrap());
+        dup_sigs.push_back(sigs.get(0).unwrap());
+
+        let mut dup_pks = Vec::new(&env);
+        dup_pks.push_back(pks.get(0).unwrap());
+        dup_pks.push_back(pks.get(0).unwrap());
+
+        client.verify_threshold_signatures(&message, &dup_sigs, &dup_pks, &2, &nonce, &expiration_ledger);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_threshold_signature_insufficient_signatures_reverts() {
+        let env = Env::default();
+        env.ledger().set_sequence_number(100);
+        let contract_id = env.register_contract(None, SpooVaultStellar);
+        let client = SpooVaultStellarClient::new(&env, &contract_id);
+
+        let message_bytes = b"InsufficientSignatures";
+        let message = Bytes::from_slice(&env, message_bytes);
+        let expiration_ledger = 500u32;
+
+        // 1 signature provided but threshold is 2
+        let (sigs, pks) = build_ed25519_threshold_batch(&env, &[1], message_bytes, 123, expiration_ledger);
+        client.verify_threshold_signatures(&message, &sigs, &pks, &2, &123, &expiration_ledger);
+    }
+
+    #[test]
+    fn test_approve_access_threshold_flow() {
+        let env = Env::default();
+        env.ledger().set_sequence_number(100);
+        let contract_id = env.register_contract(None, SpooVaultStellar);
+        let client = SpooVaultStellarClient::new(&env, &contract_id);
+
+        let creator = Address::generate(&env);
+        let g1 = Address::generate(&env);
+        let requester = Address::generate(&env);
+        env.mock_all_auths();
+
+        let name = String::from_str(&env, "Threshold Vault");
+        let desc = String::from_str(&env, "Vault using threshold approvals");
+        let guardians = vec![&env, g1.clone()];
+
+        let vault_id = client.create_vault(&creator, &name, &desc, &guardians, &2);
+        client.accept_guardian_invite(&g1, &vault_id);
+
+        let doc_id = client.add_document(
+            &creator,
+            &vault_id,
+            &String::from_str(&env, "{\"title\":\"threshold-test\"}"),
+            &String::from_str(&env, "QmThresholdHash123"),
+            &AccessLevel::Read,
+            &ReleaseCondition::Anytime,
+            &vec![&env, creator.clone(), g1.clone()],
+            &vec![&env, String::from_str(&env, "s1"), String::from_str(&env, "s2")],
+        );
+        let req_id = client.request_access(&requester, &doc_id);
+
+        let mut msg_payload = std::vec::Vec::new();
+        msg_payload.extend_from_slice(b"ApproveAccess:");
+        msg_payload.extend_from_slice(&req_id.to_be_bytes());
+        msg_payload.extend_from_slice(&vault_id.to_be_bytes());
+
+        let nonce = 5555u64;
+        let expiration_ledger = 1000u32;
+        let (sigs, pks) = build_ed25519_threshold_batch(&env, &[1, 2], &msg_payload, nonce, expiration_ledger);
+
+        let share = Some(String::from_str(&env, "beneficiary_share_data"));
+        client.approve_access_threshold(
+            &creator,
+            &req_id,
+            &sigs,
+            &pks,
+            &nonce,
+            &expiration_ledger,
+            &share,
+        );
+
+        let request = client.get_access_request(&req_id).unwrap();
+        assert_eq!(request.status, RequestStatus::Approved);
+    }
 }

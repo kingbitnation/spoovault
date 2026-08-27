@@ -196,23 +196,30 @@ export const createMultipartFileStream = (
 
   const epilogue = `${metadataPart}\r\n--${boundary}--\r\n`;
 
+  const reader = fileStream.getReader();
+  let drainDone = false;
+
   const body = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      try {
-        controller.enqueue(textEncoder.encode(preambleParts.join("")));
-        const reader = fileStream.getReader();
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (value && value.byteLength > 0) {
-            controller.enqueue(value);
-          }
+    start(controller) {
+      controller.enqueue(textEncoder.encode(preambleParts.join("")));
+    },
+    async pull(controller) {
+      if (!drainDone) {
+        const { done, value } = await reader.read();
+        if (done) {
+          drainDone = true;
+          controller.enqueue(textEncoder.encode(epilogue));
+          return;
         }
-        controller.enqueue(textEncoder.encode(epilogue));
-        controller.close();
-      } catch (error) {
-        controller.error(error);
+        if (value && value.byteLength > 0) {
+          controller.enqueue(value);
+        }
+        return;
       }
+      controller.close();
+    },
+    cancel() {
+      reader.cancel();
     },
   });
 

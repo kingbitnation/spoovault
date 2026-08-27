@@ -186,35 +186,6 @@ interface ISpooVault is IERC165 {
     function approveAccess(uint256 requestId, string calldata encryptedShareForBeneficiary) external;
 
     /**
-     * @notice Validate an EIP-712 GuardianDelegation signature.
-     */
-    function verifyDelegation(
-        address guardian,
-        address delegate,
-        uint256 vaultId,
-        uint256 validUntil,
-        uint256 nonce,
-        bytes calldata signature
-    ) external view;
-
-    /**
-     * @notice Revoke a previously signed GuardianDelegation nonce.
-     */
-    function revokeDelegation(uint256 nonce) external;
-
-    /**
-     * @notice Approve a pending access request as a delegate of `guardian`.
-     */
-    function approveAccessByDelegation(
-        uint256 requestId,
-        address guardian,
-        uint256 validUntil,
-        uint256 nonce,
-        bytes calldata signature,
-        string calldata encryptedShareForBeneficiary
-    ) external;
-
-    /**
      * @notice Revoke user access to a specific document (Guardian only).
      * @param documentId The ID of the target document.
      * @param user The address of the user whose access is revoked.

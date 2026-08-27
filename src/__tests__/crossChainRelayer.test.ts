@@ -1,8 +1,13 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
 import { CrossChainRelayerService, CrossChainPayload } from "../services/crossChainRelayer.service";
 
 describe("Axelar Cross-Chain Message Relayer", () => {
   const secretKey = "relayer-secret-key-12345";
+  let relayer: CrossChainRelayerService;
+
+  beforeEach(() => {
+    relayer = new CrossChainRelayerService();
+  });
 
   const basePayload = (): CrossChainPayload => ({
     vaultGID: "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
@@ -12,7 +17,6 @@ describe("Axelar Cross-Chain Message Relayer", () => {
   });
 
   it("signs and verifies cross-chain approval payload", () => {
-    const relayer = new CrossChainRelayerService();
     const mockPayload = basePayload();
     const signedPayload = CrossChainRelayerService.signPayload(mockPayload, secretKey);
     expect(signedPayload.signature).toBeDefined();
@@ -23,9 +27,6 @@ describe("Axelar Cross-Chain Message Relayer", () => {
   });
 
   it("prevents replay attacks on duplicate execution", () => {
-    const relayer = new CrossChainRelayerService();
-    // Unique timestamp so this case does not collide with hashes from other tests
-    // that share the same vaultGID/guardian/approvalType.
     const mockPayload = { ...basePayload(), timestamp: Date.now() + 1 };
     const signedPayload = CrossChainRelayerService.signPayload(mockPayload, secretKey);
 

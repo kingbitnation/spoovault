@@ -116,9 +116,10 @@ const CONTRACT_ABI = [
   "function requestAccess(uint256 documentId) external returns (uint256)",
   "function approveAccess(uint256 requestId) external",
   "function approveAccess(uint256 requestId, string encryptedShareForBeneficiary) external",
-  "function verifyDelegation(address guardian, address delegate, uint256 vaultId, uint256 validUntil, uint256 nonce, bytes signature) external view",
+  "function verifyDelegation(address guardian, address delegate, uint256 vaultId, uint256 validUntil, uint256 nonce, bytes signature) external view returns (bool)",
   "function revokeDelegation(uint256 nonce) external",
-  "function approveAccessByDelegation(uint256 requestId, address guardian, uint256 validUntil, uint256 nonce, bytes signature, string encryptedShareForBeneficiary) external",
+  "function approveAccessDelegated(uint256 requestId, address guardian, uint256 validUntil, uint256 nonce, bytes signature) external",
+  "function approveAccessDelegated(uint256 requestId, address guardian, uint256 validUntil, uint256 nonce, bytes signature, string encryptedShareForBeneficiary) external",
   "function revokedNonces(address guardian, uint256 nonce) external view returns (bool)",
   "function acceptGuardianInvite(uint256 vaultId) external",
   "function accessRequests(uint256 requestId) external view returns (uint256 requestId, uint256 documentId, address requester, uint8 status, uint256 expiresAt, uint256 createdAt)",
@@ -156,7 +157,8 @@ const CONTRACT_ABI = [
   "event KeeperAuthorized(uint256 indexed vaultId, address indexed owner, address indexed keeper, uint256 expiresAt)",
   "event KeeperRevoked(uint256 indexed vaultId, address indexed owner)",
   "event ProofOfLifeRelayed(uint256 indexed vaultId, address indexed owner, address indexed keeper, uint256 timestamp)",
-  "event DelegationNonceRevoked(address indexed guardian, uint256 indexed nonce)",
+  "event DelegationRevoked(address indexed guardian, uint256 indexed nonce)",
+  "event DelegatedApprovalSubmitted(uint256 indexed requestId, address indexed guardian, address indexed delegate)",
 ];
 
 const KEEPER_AUTHORIZATION_EIP712_TYPES = {
@@ -1542,7 +1544,7 @@ const signGuardianDelegation = async (
   });
 };
 
-const approveAccessByDelegation = async (
+const approveAccessDelegated = async (
   requestId: number,
   guardian: string,
   validUntil: number,
@@ -1551,25 +1553,36 @@ const approveAccessByDelegation = async (
   encryptedShareForBeneficiary = ""
 ): Promise<void> => {
   const contract = ensureWriteContract();
-  if (
-    !contractHasFunction(
-      contract,
-      "approveAccessByDelegation(uint256,address,uint256,uint256,bytes,string)"
-    )
-  ) {
+  const withShare =
+    "approveAccessDelegated(uint256,address,uint256,uint256,bytes,string)";
+  const withoutShare =
+    "approveAccessDelegated(uint256,address,uint256,uint256,bytes)";
+  if (!contractHasFunction(contract, withShare) && !contractHasFunction(contract, withoutShare)) {
     throw new Error("Current contract does not support guardian approval delegation.");
   }
-  const tx = await contract.approveAccessByDelegation(
-    requestId,
-    guardian,
-    validUntil,
-    nonce,
-    signature,
-    encryptedShareForBeneficiary
-  );
+  const tx =
+    encryptedShareForBeneficiary && contractHasFunction(contract, withShare)
+      ? await contract["approveAccessDelegated(uint256,address,uint256,uint256,bytes,string)"](
+          requestId,
+          guardian,
+          validUntil,
+          nonce,
+          signature,
+          encryptedShareForBeneficiary
+        )
+      : await contract["approveAccessDelegated(uint256,address,uint256,uint256,bytes)"](
+          requestId,
+          guardian,
+          validUntil,
+          nonce,
+          signature
+        );
   await waitForReceipt(tx);
   clearAccessCache();
 };
+
+/** @deprecated Use approveAccessDelegated */
+const approveAccessByDelegation = approveAccessDelegated;
 
 const revokeDelegation = async (nonce: number): Promise<void> => {
   const contract = ensureWriteContract();
@@ -2379,6 +2392,7 @@ export const contractService = {
   relayProofOfLife,
   getKeeperAuthorization,
   signGuardianDelegation,
+  approveAccessDelegated,
   approveAccessByDelegation,
   revokeDelegation,
   isDelegationNonceRevoked,
