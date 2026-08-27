@@ -1,9 +1,13 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
 import { CrossChainRelayerService, CrossChainPayload } from "../services/crossChainRelayer.service";
 
 describe("Axelar Cross-Chain Message Relayer", () => {
   const secretKey = "relayer-secret-key-12345";
-  const relayer = new CrossChainRelayerService();
+  let relayer: CrossChainRelayerService;
+
+  beforeEach(() => {
+    relayer = new CrossChainRelayerService();
+  });
 
   const mockPayload: CrossChainPayload = {
     vaultGID: "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",

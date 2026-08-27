@@ -67,16 +67,44 @@ const getWebCrypto = (): Crypto => {
   return cryptoObj;
 };
 
-const toArrayBuffer = (bytes: Uint8Array): ArrayBuffer => {
-  const buffer = new ArrayBuffer(bytes.byteLength);
-  new Uint8Array(buffer).set(bytes);
-  return buffer;
+/**
+ * Extract the ArrayBuffer backing a Uint8Array view.
+ * Returns the underlying buffer directly when the view covers it entirely
+ * (zero-copy); otherwise slices just the view's portion (one copy).
+ */
+const toExactBuffer = (view: Uint8Array): ArrayBuffer => {
+  if (view.byteOffset === 0 && view.byteLength === view.buffer.byteLength) {
+    return view.buffer as ArrayBuffer;
+  }
+  return view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength) as ArrayBuffer;
 };
 
 const concatBytes = (a: Uint8Array, b: Uint8Array): Uint8Array => {
   const out = new Uint8Array(a.byteLength + b.byteLength);
   if (a.byteLength > 0) out.set(a, 0);
   if (b.byteLength > 0) out.set(b, a.byteLength);
+  return out;
+};
+
+/**
+ * Efficiently drain `count` bytes from the front of a chunk list.
+ * Returns a single Uint8Array; fully consumed source chunks are removed
+ * so their ArrayBuffers can be garbage-collected.
+ */
+const drainChunks = (chunks: Uint8Array[], count: number): Uint8Array => {
+  const out = new Uint8Array(count);
+  let offset = 0;
+  while (offset < count) {
+    const head = chunks[0];
+    const take = Math.min(head.byteLength, count - offset);
+    out.set(head.subarray(0, take), offset);
+    offset += take;
+    if (take === head.byteLength) {
+      chunks.shift();
+    } else {
+      chunks[0] = head.subarray(take);
+    }
+  }
   return out;
 };
 
@@ -88,10 +116,10 @@ const readUint32BE = (bytes: Uint8Array, offset: number): number => {
   return new DataView(bytes.buffer, bytes.byteOffset + offset, 4).getUint32(0, false);
 };
 
-const chunkIndexAad = (chunkIndex: number): ArrayBuffer => {
+const chunkIndexAad = (chunkIndex: number): Uint8Array => {
   const aad = new Uint8Array(4);
   writeUint32BE(new DataView(aad.buffer), 0, chunkIndex >>> 0);
-  return aad.buffer;
+  return aad;
 };
 
 const touchStats = (stats: StreamingMemoryStats | undefined, bufferBytes: number): void => {
@@ -112,13 +140,17 @@ export async function importStreamingKey(keyHex: string): Promise<CryptoKey> {
   for (let i = 0; i < 32; i++) {
     keyBytes[i] = Number.parseInt(keyHex.slice(i * 2, i * 2 + 2), 16);
   }
-  return getWebCrypto().subtle.importKey(
-    "raw",
-    toArrayBuffer(keyBytes),
-    { name: "AES-GCM", length: 256 },
-    false,
-    ["encrypt", "decrypt"]
-  );
+  try {
+    return await getWebCrypto().subtle.importKey(
+      "raw",
+      keyBytes,
+      { name: "AES-GCM", length: 256 },
+      false,
+      ["encrypt", "decrypt"]
+    );
+  } finally {
+    keyBytes.fill(0);
+  }
 }
 
 export function isStreamingEncryptedPrefix(bytes: Uint8Array): boolean {
@@ -168,11 +200,11 @@ export function createEncryptTransform(
 ): TransformStream<Uint8Array, Uint8Array> {
   const chunkSize = options.chunkSize ?? STREAMING_CHUNK_SIZE;
   const stats = options.stats;
-  let pending: Uint8Array = new Uint8Array(0);
+  const pendingChunks: Uint8Array[] = [];
+  let pendingLen = 0;
   let chunkIndex = 0;
   let headerSent = false;
   let bytesProcessed = 0;
-  let emittedChunk = false;
 
   const encryptChunk = async (plaintext: Uint8Array): Promise<Uint8Array> => {
     const iv = new Uint8Array(STREAMING_IV_LENGTH);
@@ -182,12 +214,12 @@ export function createEncryptTransform(
       await getWebCrypto().subtle.encrypt(
         {
           name: "AES-GCM",
-          iv: toArrayBuffer(iv),
-          additionalData: chunkIndexAad(chunkIndex),
+          iv: toExactBuffer(iv),
+          additionalData: toExactBuffer(chunkIndexAad(chunkIndex)),
           tagLength: STREAMING_TAG_LENGTH * 8,
         },
         key,
-        toArrayBuffer(plaintext)
+        toExactBuffer(plaintext)
       )
     );
 
@@ -197,7 +229,6 @@ export function createEncryptTransform(
     frame.set(ciphertext, 4 + STREAMING_IV_LENGTH);
 
     chunkIndex += 1;
-    emittedChunk = true;
     if (stats) {
       stats.chunkCount += 1;
       stats.bytesOut += frame.byteLength;
@@ -216,22 +247,22 @@ export function createEncryptTransform(
         throw new Error("Encrypt transform expects Uint8Array chunks");
       }
       if (stats) stats.bytesIn += chunk.byteLength;
-      pending = concatBytes(pending, chunk);
-      touchStats(stats, pending.byteLength + chunkSize + STREAMING_IV_LENGTH + STREAMING_TAG_LENGTH);
+      pendingChunks.push(chunk);
+      pendingLen += chunk.byteLength;
+      touchStats(stats, pendingLen + chunkSize + STREAMING_IV_LENGTH + STREAMING_TAG_LENGTH);
 
-      while (pending.byteLength >= chunkSize) {
-        // Copy out the plaintext chunk so prior buffers can be GC'd (subarray would retain them).
-        const plain = pending.slice(0, chunkSize);
-        pending = pending.slice(chunkSize);
+      while (pendingLen >= chunkSize) {
+        const plain = drainChunks(pendingChunks, chunkSize);
+        pendingLen -= chunkSize;
         const frame = await encryptChunk(plain);
         controller.enqueue(frame);
-        bytesProcessed += plain.byteLength;
+        bytesProcessed += chunkSize;
         options.onProgress?.({
           phase: "encrypting",
           bytesProcessed,
           totalBytes: options.totalBytes,
         });
-        touchStats(stats, pending.byteLength + chunkSize);
+        touchStats(stats, pendingLen + chunkSize);
       }
     },
     async flush(controller) {
@@ -239,18 +270,19 @@ export function createEncryptTransform(
         controller.enqueue(buildHeader(chunkSize));
       }
       // Always emit a final frame (including empty plaintext) so decrypt can authenticate EOF.
-      const frame = await encryptChunk(pending);
+      const remaining = pendingLen > 0
+        ? drainChunks(pendingChunks, pendingLen)
+        : new Uint8Array(0);
+      const frame = await encryptChunk(remaining);
       controller.enqueue(frame);
-      bytesProcessed += pending.byteLength;
-      pending = new Uint8Array(0);
+      bytesProcessed += remaining.byteLength;
+      pendingChunks.length = 0;
+      pendingLen = 0;
       options.onProgress?.({
         phase: "encrypting",
         bytesProcessed,
         totalBytes: options.totalBytes,
       });
-      if (!emittedChunk) {
-        throw new Error("Streaming encryption produced no frames");
-      }
     },
   });
 }
@@ -263,7 +295,8 @@ export function createDecryptTransform(
   options: DecryptTransformOptions = {}
 ): TransformStream<Uint8Array, Uint8Array> {
   const stats = options.stats;
-  let buffer: Uint8Array = new Uint8Array(0);
+  const bufferChunks: Uint8Array[] = [];
+  let bufferLen = 0;
   let headerParsed = false;
   let chunkSize = STREAMING_CHUNK_SIZE;
   let chunkIndex = 0;
@@ -271,10 +304,9 @@ export function createDecryptTransform(
   let finalized = false;
 
   const take = (n: number): Uint8Array | null => {
-    if (buffer.byteLength < n) return null;
-    // slice() copies so consumed prefix buffers can be garbage-collected.
-    const out = buffer.slice(0, n);
-    buffer = buffer.slice(n);
+    if (bufferLen < n) return null;
+    const out = drainChunks(bufferChunks, n);
+    bufferLen -= n;
     return out;
   };
 
@@ -287,26 +319,27 @@ export function createDecryptTransform(
         throw new Error("Decrypt transform expects Uint8Array chunks");
       }
       if (stats) stats.bytesIn += chunk.byteLength;
-      buffer = concatBytes(buffer, chunk);
-      touchStats(stats, buffer.byteLength);
+      bufferChunks.push(chunk);
+      bufferLen += chunk.byteLength;
+      touchStats(stats, bufferLen);
 
       if (!headerParsed) {
-        if (buffer.byteLength < STREAMING_HEADER_SIZE) return;
+        if (bufferLen < STREAMING_HEADER_SIZE) return;
         const header = take(STREAMING_HEADER_SIZE)!;
         ({ chunkSize } = parseHeader(header));
         headerParsed = true;
       }
 
       while (true) {
-        if (buffer.byteLength < 4) return;
-        const plaintextLen = readUint32BE(buffer, 0);
+        if (bufferLen < 4) return;
+        const plaintextLen = readUint32BE(bufferChunks[0], 0);
         if (plaintextLen > chunkSize) {
           throw new Error(
             `Invalid streaming frame length ${plaintextLen} (max ${chunkSize})`
           );
         }
         const frameBodyLen = 4 + STREAMING_IV_LENGTH + plaintextLen + STREAMING_TAG_LENGTH;
-        if (buffer.byteLength < frameBodyLen) return;
+        if (bufferLen < frameBodyLen) return;
 
         const frame = take(frameBodyLen)!;
         const iv = frame.subarray(4, 4 + STREAMING_IV_LENGTH);
@@ -317,12 +350,12 @@ export function createDecryptTransform(
           plaintext = await getWebCrypto().subtle.decrypt(
             {
               name: "AES-GCM",
-              iv: toArrayBuffer(iv),
-              additionalData: chunkIndexAad(chunkIndex),
+              iv: toExactBuffer(iv),
+              additionalData: toExactBuffer(chunkIndexAad(chunkIndex)),
               tagLength: STREAMING_TAG_LENGTH * 8,
             },
             key,
-            toArrayBuffer(ciphertext)
+            toExactBuffer(ciphertext)
           );
         } catch {
           throw new Error(
@@ -350,7 +383,7 @@ export function createDecryptTransform(
         // A short (or empty) frame marks the end of the stream.
         if (plaintextLen < chunkSize) {
           finalized = true;
-          if (buffer.byteLength > 0) {
+          if (bufferLen > 0) {
             throw new Error("Trailing bytes after final streaming crypto frame");
           }
           return;
@@ -364,7 +397,7 @@ export function createDecryptTransform(
       if (!finalized) {
         throw new Error("Truncated streaming ciphertext (missing final frame)");
       }
-      if (buffer.byteLength > 0) {
+      if (bufferLen > 0) {
         throw new Error("Trailing bytes after streaming ciphertext");
       }
     },

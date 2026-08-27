@@ -1,4 +1,4 @@
-import Dexie, { Table } from 'dexie';
+import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
 import { ethers } from 'ethers';
 import {
   generateBLSKeyPair,
@@ -29,25 +29,35 @@ interface StoredBLSKey {
   isActive: boolean;
 }
 
-class BLSKeyDatabase extends Dexie {
-  keys!: Table<StoredBLSKey, number>;
-
-  constructor() {
-    super('SpooVaultBLSDB');
-    this.version(1).stores({
-      keys: '++id, &guardianAddress, publicKey, createdAt, isActive'
-    });
-  }
+interface SpooVaultBLSDBSchema extends DBSchema {
+  keys: {
+    key: number;
+    value: StoredBLSKey;
+    indexes: {
+      guardianAddress: string;
+    };
+  };
 }
 
 export class BLSKeyringService {
   private static instance: BLSKeyringService;
-  private db: BLSKeyDatabase;
+  private dbPromise: Promise<IDBPDatabase<SpooVaultBLSDBSchema> | null> | null = null;
   private activeKey: BLSKeyPair | null = null;
   private memoryFallback: Map<string, StoredBLSKey> = new Map();
 
-  private constructor() {
-    this.db = new BLSKeyDatabase();
+  private constructor() {}
+
+  private async getDb(): Promise<IDBPDatabase<SpooVaultBLSDBSchema> | null> {
+    if (typeof globalThis.indexedDB === 'undefined') return null;
+    if (!this.dbPromise) {
+      this.dbPromise = openDB<SpooVaultBLSDBSchema>('SpooVaultBLSDB', 1, {
+        upgrade(db) {
+          const store = db.createObjectStore('keys', { keyPath: 'id', autoIncrement: true });
+          store.createIndex('guardianAddress', 'guardianAddress', { unique: true });
+        },
+      }).catch(() => null);
+    }
+    return this.dbPromise;
   }
 
   public static getInstance(): BLSKeyringService {
@@ -119,18 +129,21 @@ export class BLSKeyringService {
     }
 
     try {
-      const stored = await this.db.keys.where('guardianAddress').equals(normalizedAddress).first();
-      if (stored) {
-        const keyPair: BLSKeyPair = {
-          privateKey: stored.privateKey,
-          publicKey: stored.publicKey,
-          proofOfPossession: stored.proofOfPossession,
-          createdAt: stored.createdAt,
-          guardianAddress: stored.guardianAddress,
-          vaultIds: stored.vaultIds
-        };
-        this.activeKey = keyPair;
-        return keyPair;
+      const db = await this.getDb();
+      if (db) {
+        const stored = await db.getFromIndex('keys', 'guardianAddress', normalizedAddress);
+        if (stored) {
+          const keyPair: BLSKeyPair = {
+            privateKey: stored.privateKey,
+            publicKey: stored.publicKey,
+            proofOfPossession: stored.proofOfPossession,
+            createdAt: stored.createdAt,
+            guardianAddress: stored.guardianAddress,
+            vaultIds: stored.vaultIds
+          };
+          this.activeKey = keyPair;
+          return keyPair;
+        }
       }
     } catch {
       const mem = this.memoryFallback.get(normalizedAddress);
@@ -358,11 +371,17 @@ export class BLSKeyringService {
     };
 
     try {
-      const existing = await this.db.keys.where('guardianAddress').equals(guardianAddress).first();
-      if (existing && existing.id) {
-        await this.db.keys.update(existing.id, record as any);
+      const db = await this.getDb();
+      if (db) {
+        const existing = await db.getFromIndex('keys', 'guardianAddress', guardianAddress);
+        if (existing && existing.id) {
+          record.id = existing.id;
+          await db.put('keys', record);
+        } else {
+          await db.add('keys', record);
+        }
       } else {
-        await this.db.keys.add(record);
+        this.memoryFallback.set(guardianAddress, record);
       }
     } catch {
       this.memoryFallback.set(guardianAddress, record);

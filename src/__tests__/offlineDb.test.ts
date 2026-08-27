@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
+import { IDBFactory } from "fake-indexeddb";
 import "fake-indexeddb/auto";
 import {
   __setOfflineDbFactoryForTests,
