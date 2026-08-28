@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Optimizer `runs` is 1 (size-biased). Tests deploy via `test/helpers/deploySpooVault.cjs`.
   - `npm run test:stellar` runs cargo against a temp `CARGO_TARGET_DIR` so Windows Application Control does not block the test binary under Documents.
   - `cargo test` no longer requires the upgrade-fixture Wasm; CI enables `--features upgrade-tests` after building it.
+- **EIP-712 Guardian Approval Delegation (client helpers)**:
+  - `contractService`: `signGuardianDelegation`, `approveAccessDelegated`, `revokeDelegation`, and `isDelegationNonceRevoked` for on-chain `GuardianDelegation` grants (`approveAccessDelegated` / `revokedNonces`).
 - **EIP-712 / Soroban Auth Relayer for Automated Proof-of-Life Heartbeats (Issue #32)**:
   - `SpooVault.sol`: `authorizeKeeperBySig`, `revokeKeeper`, and `proveLifeByKeeper` let a vault owner delegate proof-of-life heartbeats to a Web3 Keeper (Chainlink Automation / Gelato) via a one-time EIP-712 typed signature, so the keeper can relay heartbeats on its own signed transactions until the delegation expires without needing a fresh owner signature each time.
   - `contracts-stellar/src/lib.rs`: `authorize_keeper`, `revoke_keeper`, and `prove_life_by_keeper` mirror the same delegation model using Soroban's native `require_auth`, which already decouples the authorizing owner from the fee-paying/submitting keeper.

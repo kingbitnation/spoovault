@@ -9,14 +9,15 @@ describe("Axelar Cross-Chain Message Relayer", () => {
     relayer = new CrossChainRelayerService();
   });
 
-  const mockPayload: CrossChainPayload = {
+  const basePayload = (): CrossChainPayload => ({
     vaultGID: "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
     guardian: "0x1111111111111111111111111111111111111111",
     approvalType: 1,
     timestamp: Date.now(),
-  };
+  });
 
   it("signs and verifies cross-chain approval payload", () => {
+    const mockPayload = basePayload();
     const signedPayload = CrossChainRelayerService.signPayload(mockPayload, secretKey);
     expect(signedPayload.signature).toBeDefined();
 
@@ -26,8 +27,9 @@ describe("Axelar Cross-Chain Message Relayer", () => {
   });
 
   it("prevents replay attacks on duplicate execution", () => {
+    const mockPayload = { ...basePayload(), timestamp: Date.now() + 1 };
     const signedPayload = CrossChainRelayerService.signPayload(mockPayload, secretKey);
-    
+
     relayer.processMessage(signedPayload, secretKey);
 
     expect(() => relayer.processMessage(signedPayload, secretKey)).toThrow(
