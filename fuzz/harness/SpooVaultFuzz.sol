@@ -2,8 +2,6 @@
 pragma solidity ^0.8.20;
 
 import "../../contracts/SpooVault.sol";
-import "../../contracts/libraries/EmergencyVrfLogic.sol";
-import "../../contracts/libraries/SpooVaultAdminLogic.sol";
 import "./SpooVaultFuzzBytecode.sol";
 
 /**
@@ -79,8 +77,8 @@ contract SpooVaultFuzz {
     uint256 private trackedSupply;
 
     constructor() {
-        address vrfLib = address(new EmergencyVrfLogic());
-        address adminLib = address(new SpooVaultAdminLogic());
+        address vrfLib = SpooVaultFuzzBytecode.deployEmergencyVrfLogic();
+        address adminLib = SpooVaultFuzzBytecode.deploySpooVaultAdminLogic();
         vault = SpooVault(payable(SpooVaultFuzzBytecode.deployLinkedVault(vrfLib, adminLib)));
         guardian2 = new FuzzGuardian(vault);
 
