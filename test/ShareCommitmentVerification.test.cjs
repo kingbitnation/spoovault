@@ -1,5 +1,6 @@
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
+const { deploySpooVault } = require("./helpers/deploySpooVault.cjs");
 
 describe("SpooVault Cryptographic Share Commitment Verification", function () {
   let spooVault;
@@ -14,9 +15,7 @@ describe("SpooVault Cryptographic Share Commitment Verification", function () {
   beforeEach(async function () {
     [owner, guardian1, guardian2, beneficiary] = await ethers.getSigners();
 
-    const SpooVault = await ethers.getContractFactory("SpooVault");
-    spooVault = await SpooVault.deploy();
-    await spooVault.waitForDeployment();
+    spooVault = await deploySpooVault(owner);
 
     // Create a vault with 2 guardians and threshold 2
     const guardians = [guardian1.address, guardian2.address];

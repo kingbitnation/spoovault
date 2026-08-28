@@ -1,8 +1,9 @@
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
+const { deploySpooVault } = require("./helpers/deploySpooVault.cjs");
 
 describe("SpooVault Fully Homomorphic Encryption (FHE) Share Aggregation", function () {
-  let SpooVault, spooVault;
+  let spooVault;
   let owner, guardian1, guardian2, guardian3, beneficiary, nonGuardian;
 
   // FHE Prime Modulus q (secp256k1 field prime)
@@ -81,9 +82,7 @@ describe("SpooVault Fully Homomorphic Encryption (FHE) Share Aggregation", funct
     [owner, guardian1, guardian2, guardian3, beneficiary, nonGuardian] =
       await ethers.getSigners();
 
-    SpooVault = await ethers.getContractFactory("SpooVault");
-    spooVault = await SpooVault.deploy();
-    await spooVault.waitForDeployment();
+    spooVault = await deploySpooVault(owner);
   });
 
   describe("FHE Share Storage and Retrieval", function () {

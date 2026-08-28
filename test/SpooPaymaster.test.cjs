@@ -20,6 +20,7 @@
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
 const { time } = require("@nomicfoundation/hardhat-network-helpers");
+const { deploySpooVault } = require("./helpers/deploySpooVault.cjs");
 
 describe("SpooPaymaster - EIP-4337 Gasless Guardian Approvals", function () {
   let spooVault;
@@ -42,10 +43,8 @@ describe("SpooPaymaster - EIP-4337 Gasless Guardian Approvals", function () {
     [owner, vaultCreator, guardianSigner, beneficiary, bundler, other] =
       await ethers.getSigners();
 
-    // 1. Deploy SpooVault
-    const SpooVault = await ethers.getContractFactory("SpooVault");
-    spooVault = await SpooVault.deploy();
-    await spooVault.waitForDeployment();
+    // 1. Deploy SpooVault (with VRF/admin libraries linked)
+    spooVault = await deploySpooVault(owner);
 
     // 2. Deploy Mock EntryPoint
     const MockEntryPoint = await ethers.getContractFactory("MockEntryPoint");

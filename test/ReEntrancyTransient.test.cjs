@@ -1,5 +1,6 @@
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
+const { deploySpooVault } = require("./helpers/deploySpooVault.cjs");
 
 describe("Re-Entrancy Guard Hardening (EIP-1153 Transient Storage)", function () {
   let spooVault;
@@ -8,9 +9,7 @@ describe("Re-Entrancy Guard Hardening (EIP-1153 Transient Storage)", function ()
   beforeEach(async function () {
     [owner, guardian, user] = await ethers.getSigners();
 
-    const SpooVault = await ethers.getContractFactory("SpooVault");
-    spooVault = await SpooVault.deploy();
-    await spooVault.waitForDeployment();
+    spooVault = await deploySpooVault(owner);
   });
 
   async function setupVaultAndDocument() {

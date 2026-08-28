@@ -1,5 +1,6 @@
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
+const { deploySpooVault } = require("./helpers/deploySpooVault.cjs");
 
 describe("BLS Threshold vs ECDSA Gas Benchmark", function () {
   let spooVault;
@@ -31,9 +32,7 @@ describe("BLS Threshold vs ECDSA Gas Benchmark", function () {
     requester2 = signers[2];
     guardians = signers.slice(3, 13).sort((a, b) => (a.address.toLowerCase() < b.address.toLowerCase() ? -1 : 1)); // K = 10 guardians sorted
 
-    const SpooVault = await ethers.getContractFactory("SpooVault");
-    spooVault = await SpooVault.deploy();
-    await spooVault.waitForDeployment();
+    spooVault = await deploySpooVault(owner);
 
     const MockBLSVerifier = await ethers.getContractFactory("MockBLSVerifier");
     mockVerifier = await MockBLSVerifier.deploy();

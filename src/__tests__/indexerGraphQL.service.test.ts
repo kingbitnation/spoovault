@@ -178,8 +178,13 @@ describe('subscribeToVaultActivity (WebSocket push updates)', () => {
       received.push(event);
     });
 
-    // Give the WS handshake a tick to complete before publishing.
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    // Wait until the subscription handler is registered before publishing.
+    await vi.waitFor(
+      () => {
+        expect(activityPublishers.size).toBeGreaterThan(0);
+      },
+      { timeout: 5000 }
+    );
 
     const event = {
       id: 'evt-1',
@@ -192,7 +197,7 @@ describe('subscribeToVaultActivity (WebSocket push updates)', () => {
 
     await vi.waitFor(() => {
       expect(received).toHaveLength(1);
-    });
+    }, { timeout: 5000 });
     expect(received[0]).toEqual(event);
 
     unsubscribe();

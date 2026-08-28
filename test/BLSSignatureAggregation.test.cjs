@@ -1,5 +1,6 @@
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
+const { deploySpooVault } = require("./helpers/deploySpooVault.cjs");
 
 describe("SpooVault Threshold BLS Signature Aggregation", function () {
   let spooVault;
@@ -31,9 +32,7 @@ describe("SpooVault Threshold BLS Signature Aggregation", function () {
     [owner, guardian1, guardian2, guardian3, guardian4, requester, stranger] =
       await ethers.getSigners();
 
-    const SpooVault = await ethers.getContractFactory("SpooVault");
-    spooVault = await SpooVault.deploy();
-    await spooVault.waitForDeployment();
+    spooVault = await deploySpooVault(owner);
 
     // Create a vault with owner + 4 external guardians (5 total), approval threshold = 3
     const guardians = [
