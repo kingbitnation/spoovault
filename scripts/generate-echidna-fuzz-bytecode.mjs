@@ -45,9 +45,13 @@ function toSolHex(bytecode, linkReferences) {
   return chunks.map((c) => `hex"${c}"`).join("\n        ");
 }
 
-function toOffsetArray(name, offsets) {
-  const values = offsets.map((o) => `        ${o}`).join(",\n");
-  return `    uint256[${offsets.length}] internal constant ${name} = [\n${values}\n    ];`;
+function toLinkLines(offsets, libVar) {
+  return offsets
+    .map(
+      (offset) =>
+        `        creationCode = BytecodeLibraryLinker.linkAt(creationCode, ${offset}, ${libVar});`
+    )
+    .join("\n");
 }
 
 function main() {
@@ -79,18 +83,10 @@ library SpooVaultFuzzBytecode {
     bytes internal constant SPOOVAULT_UNLINKED =
         ${toSolHex(artifact.bytecode, artifact.linkReferences)};
 
-${toOffsetArray("VRF_LIBRARY_OFFSETS", vrfOffsets)}
-
-${toOffsetArray("ADMIN_LIBRARY_OFFSETS", adminOffsets)}
-
     function deployLinkedVault(address vrfLib, address adminLib) internal returns (address) {
         bytes memory creationCode = SPOOVAULT_UNLINKED;
-        for (uint256 i = 0; i < VRF_LIBRARY_OFFSETS.length; i++) {
-            creationCode = BytecodeLibraryLinker.linkAt(creationCode, VRF_LIBRARY_OFFSETS[i], vrfLib);
-        }
-        for (uint256 i = 0; i < ADMIN_LIBRARY_OFFSETS.length; i++) {
-            creationCode = BytecodeLibraryLinker.linkAt(creationCode, ADMIN_LIBRARY_OFFSETS[i], adminLib);
-        }
+${toLinkLines(vrfOffsets, "vrfLib")}
+${toLinkLines(adminOffsets, "adminLib")}
         return BytecodeLibraryLinker.deploy(creationCode);
     }
 }
