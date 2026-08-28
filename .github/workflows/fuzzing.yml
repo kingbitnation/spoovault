@@ -53,6 +53,11 @@ jobs:
             echo "path=/src/fuzz/echidna/config.yaml" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Generate linked fuzz bytecode
+        run: |
+          npx hardhat compile
+          node scripts/generate-echidna-fuzz-bytecode.mjs
+
       - name: Run Echidna campaign
         run: |
           docker run --rm \
@@ -114,6 +119,11 @@ jobs:
           else
             echo "file=medusa.json" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Generate linked fuzz bytecode
+        run: |
+          npx hardhat compile
+          node scripts/generate-echidna-fuzz-bytecode.mjs
 
       - name: Run Medusa campaign
         run: |

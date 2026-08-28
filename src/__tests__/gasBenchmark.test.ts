@@ -107,7 +107,11 @@ describe("Gas benchmark pipeline (scripts/gas-benchmark.mjs)", () => {
     });
 
     it("should keep the gate reliable when fingerprints match", () => {
-      const fp = computeCompilerFingerprint(CONFIG_A);
+      const configText = require("node:fs").readFileSync(
+        require("node:path").join(process.cwd(), "hardhat.config.cjs"),
+        "utf8"
+      );
+      const fp = computeCompilerFingerprint(configText);
       const baselineInfo = {
         gas: { "SpooVault.a": 90, "SpooVault.b": 100 },
         fingerprint: fp,
